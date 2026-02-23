@@ -2,17 +2,48 @@ import Calculator.Calculator
 
 open Tactic.Calculation
 
+set_option linter.style.multiGoal false
+
 def rev {a} : List a → List a
   | [] => []
   | x :: xs => rev xs ++ [x]
 
-structure RevSpec {a} : Type where
+def test {a} :
+  Σ' app : List a -> List a -> List a -> List a,
+  ∀ xs ys zs, app xs ys zs = xs ++ ys ++ zs := by
+  calculate fst
+  intro xs
+  induction xs <;> intro ys zs
+  case nil =>
+    rewrite [List.nil_append]
+    rfl
+  case cons x xs ih =>
+    dsimp
+    rewrite [<- ih]
+    by_def fst
+    generalize fst xs = h
+    rfl
+
+#print test
+#eval test.fst [1, 2] [3, 4] [5, 6]
+
+structure RevSpec a : Type where
   aux : List a -> List a -> List a
   correct : ∀ xs ys, aux xs ys = rev xs ++ ys
 
-structure RevSpec' : Type where
-  aux : List Int -> List Int -> List Int
-  correct : ∀ xs ys, aux xs ys = rev xs ++ ys
+def correct {a} : RevSpec a := by
+  calculate aux
+  intro xs
+  induction xs <;> intro ys
+  case nil =>
+    define aux.nil ys := ys
+  case cons x xs ih =>
+    rw [rev]
+    rw [List.append_assoc]
+    define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
+    by_def aux
+    rw [<- ih]
+    rw [List.cons_append, List.nil_append]
 
 inductive Exp : Type
   | val : Nat -> Exp
@@ -38,6 +69,25 @@ structure CompSpec where
   comp : Exp -> Code -> Code
   exec : Code -> Stack -> Stack
   correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
+
+def comp_calc2 : CompSpec := by
+  calculate comp, exec
+  intro e
+  induction e <;> intros c s
+  case val n =>
+    rewrite [eval]
+    define exec.push n c' exec_c' s := exec_c' (n :: s)
+    define comp.val n c := .push n c
+  case add x y ih_x ih_y =>
+    rw [eval]
+    generalize h : eval x = u at ih_x
+    generalize j : eval y = v at ih_y
+    define exec.add c' exec_c' s := match s with
+          | m :: n :: s' => exec_c' ((n + m) :: s')
+          | _ => exec_c' s
+    define comp.add x y cx cy c := cx (cy (.add c))
+    by_def comp
+
 
 def comp_calc : CompSpec := by
   calculate comp, exec
