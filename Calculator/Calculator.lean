@@ -153,7 +153,7 @@ def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
   Tactic.replaceMainGoal [new_main]
   return fv
 
-def calc_intro_for (field_name : Name) (fields : Array (Name × Expr))
+def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name : Name := field_name)
     : Tactic.TacticM (FVarId × List (Name × Expr))
   := do
   let (field_ty, inp_ty, mot_ty) <- match fields.find? (fun (n, _) => n = field_name) with
@@ -189,7 +189,7 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr))
   let algebras := zip algebra_mv_exps.toList ctors
   for (exp, ctor, _) in algebras do
     let mv := exp.mvarId!
-    let username := ctor.updatePrefix field_name
+    let username := ctor.updatePrefix as_name
     mv.setUserName username
     -- we also intro each recursor algebra as a local hypothesis in the main goal
     _ <- intro_let_in_main_goal username (<- mv.getType) (.mvar mv)
@@ -199,10 +199,14 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr))
   let final_ty <- instantiateExprMVars concl_ty
   -- add a 'let ... = ...' for this constructor to the main goal, and then intro it as a hypothesis
   let field_body := mkAppN recursor (ms ++ algebra_mv_exps)
-  let fv <- intro_let_in_main_goal field_name final_ty field_body
+  let fv <- intro_let_in_main_goal as_name final_ty field_body
   return (fv, algebras.map fun (mv, n, _) => (n, mv))
 
-elab (name := calculateTactic) "calculate " vs:ident,* : tactic => Tactic.withMainContext do
+declare_syntax_cat calc_name
+syntax ident : calc_name
+syntax ident "as" ident : calc_name
+
+elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.withMainContext do
   -- look at main goal, get its fields
   let main_goal <- Tactic.getMainGoal
   let main_type <- main_goal.getType''
@@ -211,15 +215,24 @@ elab (name := calculateTactic) "calculate " vs:ident,* : tactic => Tactic.withMa
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
   let fvs <- vs.getElems.mapM fun s => do
-    let field_name := s.getId
-    let (fv, algebras) <- calc_intro_for field_name spec_fields
-    return (field_name, fv, algebras)
+    dbg_trace f!"got s = {s}"
+    match s with
+    | `(calc_name| $v:ident) =>
+      let field_name := v.getId
+      let (fv, algebras) <- calc_intro_for field_name spec_fields
+      return (field_name, field_name, fv, algebras)
+    | `(calc_name| $v:ident as $r:ident) =>
+      let field_name := v.getId
+      let as_name := r.getId
+      let (fv, algebras) <- calc_intro_for field_name spec_fields (as_name := as_name)
+      return (field_name, as_name, fv, algebras)
+    | _ => throwUnsupportedSyntax
   -- split the main goal into its constructor fields, and set each one to the corresponding
   -- recursor binding from above
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
   Tactic.pushGoals field_mvs
-  for (field_name, fv, _) in fvs do
+  for (field_name, as_name, fv, _) in fvs do
     for field_mv in field_mvs do
       if (<- field_mv.getTag) == field_name then
         field_mv.assign (.fvar fv)
@@ -232,7 +245,7 @@ elab (name := calculateTactic) "calculate " vs:ident,* : tactic => Tactic.withMa
           eq <- mkForallFVars forall_args eq
           let mut proof <- mkEqRefl lhs
           proof <- mkLambdaFVars forall_args proof
-          _ <- intro_let_in_main_goal (.str field_name "eq_def") eq proof (isDef := false)
+          _ <- intro_let_in_main_goal (.str as_name "eq_def") eq proof (isDef := false)
 
 -- def rev {a} : List a → List a
 --   | [] => []
@@ -263,21 +276,21 @@ elab (name := calculateTactic) "calculate " vs:ident,* : tactic => Tactic.withMa
 def test2 {a} :
   Σ' len : List a -> Nat,
   len [] = 0 ∧ ∀ xs x, len (x :: xs) = len xs + 1 := by
-  calculate fst
+  calculate fst as len
   constructor
-  · define fst.nil := 0
+  · define len.nil := 0
   · intro xs
     induction xs
     case cons y ys ih =>
       intro x
       rw [ih]
-      -- unroll fst
-      -- generalize fst ys + 1 = h
-      -- define' fst (x::xs) := fst xs + 1
-      define fst.cons x xs l_xs := l_xs + 1
+      unroll len
+      rw [<- ih]
+      generalize len (y :: ys) = l_xs
+      define len.cons x xs l_xs := l_xs + 1
     case nil =>
       intro x
-      dsimp [fst]
+      dsimp [len]
 
 end Calculation
 end Tactic
