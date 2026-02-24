@@ -95,20 +95,19 @@ def stx_from_names (names : List Name) : TSyntaxArray `ident
 def get_rec_name (n : Name) : Name := .mkSimple s!"rec.{n}"
 
 def desugar_clause_args (inp_ty : Expr) (con_args : List Name) (clause_args : List Expr)
-  : MetaM (List (Name × Expr))
-  := match con_args, clause_args with
-  | [], _ => pure []
-  | n :: ns, t :: ts => do
-    let ct <- inferType t
-    if <- isDefEq ct inp_ty then
-      let (r::rs) := ts
-        | throwError "couldn't match 'define' arguments with defining clause"
-      let rest <- desugar_clause_args inp_ty ns rs
-      return (n, t) :: (get_rec_name n, r) :: rest
-    else
-      let rest <- desugar_clause_args inp_ty ns ts
-      return (n, t) :: rest
-  | _, [] => throwError "couldn't match 'define' arguments with defining clause (too many arguments)"
+  : MetaM (List Name)
+  := do
+  let rec_con_args <- rec_args (zip con_args clause_args)
+  return con_args ++ rec_con_args
+  where
+    rec_args (cds : List (Name × Expr)) : MetaM (List Name) := match cds with
+    | [] => pure []
+    | (n, t) :: cds => do
+      let ct <- inferType t
+      if <- isDefEq ct inp_ty then
+        return get_rec_name n :: (<- rec_args cds)
+      else
+        rec_args cds
 
 def desugar_clause_def
   (clause_of : Name)
@@ -120,7 +119,7 @@ def desugar_clause_def
   let clause_ty <- inferType clause
   let (clause_args, _, _) <- forallMetaTelescopeReducing clause_ty
   let ns <- desugar_clause_args inp_ty con_args clause_args.toList
-  let body_args := ns.map (·.fst) ++ rest_args
+  let body_args := ns ++ rest_args
   let body_node : TSyntax `term <- `(fun $(stx_from_names body_args)* => $to_term)
   let body_fn <- elabTerm body_node (some clause_ty)
   Meta.transform body_fn <| fun e => do
@@ -130,11 +129,12 @@ def desugar_clause_def
         | throwError "can't make recursive call: {<- ppExpr e}"
       let arg_name <- fv.getUserName
       let rec_name := get_rec_name arg_name
-      let some idx := ns.findIdx? fun (n, _) => n = rec_name
-        | throwError "can't make recursive call to non-immediate-subterm {arg_name}"
-      let db_idx := body_args.length - idx - 1
-      let e := mkAppN (.bvar db_idx) args.toArray
-      return .done e
+      let lctx <- getLCtx
+      for fv in lctx.getFVars do
+        if (<- fv.fvarId!.getUserName) = rec_name then
+          let e := mkAppN fv args.toArray
+          return .visit e
+      throwError "didn't find {rec_name} as a fv (bug!)"
     return .continue
 
 def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit := do
@@ -174,31 +174,30 @@ elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " t
 elab (name := defineTacticSugared) "define" mod:("only")? p:term ":=" to_term:term : tactic
   => match p with
   | `($f:ident $pat:term $rest*) => do
-    let pat <- liftMacroM <| expandMacros pat
-    let (con_stx, named, con_args_stx, ell) <- Term.expandApp pat
-    let con_stx <- if con_stx.isMissing
-      then pure pat
-      else if !named.isEmpty || ell then throwUnsupportedSyntax
-      else pure con_stx
-    let con <- match con_stx with
-      | `($conId:ident) => pure conId
-      | _ => throwErrorAt pat m!"expected a constructor application, but got {indentD pat}"
-    let some (Expr.const (.str _ con_name) _) <- resolveId? con "pattern"
-      | throwError "expected {con} to be a constructor"
-    let clause_name := Name.str f.getId con_name
-    let mctx <- getMCtx
-    let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
-      | throwErrorAt f "unknown defining clause for {f}, for constructor: {con_name})"
-    let con_args <- con_args_stx.mapM fun
-      | .stx s => if s.isIdent then pure s else throwErrorAt s "expected an identifier"
-      | _ => unreachable!
-    for rv in rest do if !rv.raw.isIdent then throwErrorAt rv "expected an identifier"
     let mctx <- getMCtx
     let (some search_fn_mv) := mctx.findUserName? f.getId
       | throwErrorAt f "the name {f} is undefined"
     let search_ty <- search_fn_mv.getType''
     let some (inp_ty, _) := search_ty.arrow?
       | throwErrorAt f "cannot define a clause in non-function {f}"
+    let pat <- liftMacroM <| expandMacros pat
+    let (con_stx, named, con_args_stx, ell) <- Term.expandApp pat
+    let con_stx <- if con_stx.isMissing
+      then pure pat
+      else if !named.isEmpty || ell then throwUnsupportedSyntax
+      else pure con_stx
+    let con_exp <- elabPattern (.mk con_stx) (some inp_ty)
+    let con_name <- match con_exp.getAppFn with
+    | .const (.str _ con_name) _ => pure con_name
+    | e => throwError "expected a constructor, but got {indentD pat} (application with {<- ppExpr e})"
+    let clause_name := Name.str f.getId con_name
+    let mctx <- getMCtx
+    let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
+      | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat})"
+    let con_args <- con_args_stx.mapM fun
+      | .stx s => if s.isIdent then pure s else throwErrorAt s "expected an identifier"
+      | _ => unreachable!
+    for rv in rest do if !rv.raw.isIdent then throwErrorAt rv "expected an identifier"
     -- construct a new function, 'fn',
     let con_arg_names := con_args.toList.map (·.getId)
     let rest_names <- rest.toList.mapM fun s => match s.raw with
@@ -331,12 +330,12 @@ structure CalcParams extends SelectInsertParams where
 structure Suggestion where
   hint : String
   info? : Option Html := none
-  newLhs : Expr
+  newLhs? : Option Expr := none
   proofStr? : Option String := none
 
-abbrev CalcSuggester := (mv : MVarId) -> (lhs : Expr) -> MetaM (Array Suggestion)
+abbrev CalcSuggester := (mv : MVarId) -> (lhs rhs : Expr) -> MetaM (Array Suggestion)
 
-def suggest_apply_hyp : CalcSuggester := fun mv lhs => do
+def suggest_apply_hyp : CalcSuggester := fun mv lhs _ => do
   let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
   let mut suggestions : Array Suggestion := #[]
   for i in lctx.decls do
@@ -354,13 +353,21 @@ def suggest_apply_hyp : CalcSuggester := fun mv lhs => do
             <span className="font-code"> : </span>
             {.ofComponent InteractiveExpr { expr := hyp_ty } #[]}
           </span>
-        newLhs := r.eNew
+        newLhs? := r.eNew
         proofStr? := some s!"rw [{d.userName}]"
       }
     catch | _ => pure ()
   return suggestions
 
-def suggest_dsimp : CalcSuggester := fun _ lhs => do
+def suggest_define_clause : CalcSuggester := fun mv lhs rhs => do
+  if !rhs.isApp then return #[]
+  return #[{
+    hint := "Define"
+    info? := some <span className="font-code">{.text s!"{<- ppExpr rhs} := {<- ppExpr lhs}"}</span>
+    proofStr? := s!"define {<- ppExpr rhs} := {<- ppExpr lhs}"
+  }]
+
+def suggest_dsimp : CalcSuggester := fun _ lhs _ => do
   let simp_ctx <- mkSimpContext
   let (lhs', stats) <- Meta.dsimp lhs simp_ctx
   if lhs == lhs' then
@@ -368,7 +375,7 @@ def suggest_dsimp : CalcSuggester := fun _ lhs => do
   else if <- isDefEq lhs lhs' then
     return #[{
       hint := "Reduce"
-      newLhs := lhs'
+      newLhs? := lhs'
       proofStr? := some "rfl"
       info? := some (.text "by reflexivity")
     }]
@@ -378,7 +385,7 @@ def suggest_dsimp : CalcSuggester := fun _ lhs => do
     let thms_str := String.join (thms.toList.intersperse ", ")
     return #[{
       hint := "Simplify (definitional)"
-      newLhs := lhs'
+      newLhs? := lhs'
       info? := some
         <span>
           {.text "using "}
@@ -387,7 +394,7 @@ def suggest_dsimp : CalcSuggester := fun _ lhs => do
       proofStr? := some s!"dsimp only [{thms_str}]"
     }]
 
-def suggest_simp : CalcSuggester := fun _ lhs => do
+def suggest_simp : CalcSuggester := fun _ lhs _ => do
   let simp_ctx <- mkSimpContext
   let (res, stats) <- Meta.simp lhs simp_ctx
   let lhs' := res.expr
@@ -399,7 +406,7 @@ def suggest_simp : CalcSuggester := fun _ lhs => do
     let thms_str := String.join (thms.toList.intersperse ", ")
     return #[{
       hint := "Simplify"
-      newLhs := lhs'
+      newLhs? := lhs'
       info? := some
         <span>
           {.text "using "}
@@ -411,7 +418,7 @@ def suggest_simp : CalcSuggester := fun _ lhs => do
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
   fun params =>
-  RequestM.withWaitFindSnapAtPos params.pos fun _ => do
+  RequestM.withWaitFindSnapAtPos params.pos fun snap => do
     let doc <- RequestM.readDoc
     let body <- match params.goals.toList with
     | [] => pure (<p>{.text "Nothing left to prove here"}</p>)
@@ -425,9 +432,10 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
       let rhsStr := (toString <| <- ppExpr rhs).renameMetaVar
       let spc := String.replicate params.indent ' '
       let mut suggestions : Array Suggestion
-        := (<- suggest_apply_hyp mv lhs)
-        ++ (<- suggest_dsimp mv lhs)
-        ++ (<- suggest_simp mv lhs)
+        := (<- suggest_apply_hyp mv lhs rhs)
+        ++ (<- suggest_dsimp mv lhs rhs)
+        ++ (<- suggest_simp mv lhs rhs)
+        ++ (<- suggest_define_clause mv lhs rhs)
       if suggestions.isEmpty then
         return <p>{.text "No suggestions"}</p>
       let ul_style := json%{
@@ -436,27 +444,45 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
       }
       let ul := Html.element "ul" #[("style", ul_style)] <|
         <- suggestions.mapM fun sugg => do
-          let exp_with_ctx <- ExprWithCtx.save sugg.newLhs
-          let exp <- WithRpcRef.mk exp_with_ctx
-          let newLhsStr := (toString <| <- ppExpr sugg.newLhs).renameMetaVar
           let proofStr := sugg.proofStr?.getD "{}"
-          let new_line := if params.isFirst then
-            s!"{lhsStr} = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
-          else
-            s!"_ = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
-          let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
-          pure <li>
-            <span style={json% { marginRight: "5px" }}>
-              {.text s!"{sugg.hint}: "}
-            </span>
-            {sugg.info?.getD (.text "")}
-            <br />
-            {.ofComponent MakeEditLink
-              (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
-              #[ .text s!"[Apply] " ]}
-            <span style={json% { paddingInline: "8px" }}>{.text "↦"}</span>
-            {.ofComponent InteractiveExpr { expr := exp } #[]}
-          </li>
+          match sugg.newLhs? with
+          | some newLhs => do
+            let exp_with_ctx <- ExprWithCtx.save newLhs
+            let exp <- WithRpcRef.mk exp_with_ctx
+            let newLhsStr := (toString <| <- ppExpr newLhs).renameMetaVar
+            let new_line := if params.isFirst then
+              s!"{lhsStr} = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
+            else
+              s!"_ = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
+            let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
+            pure <li>
+              <span style={json% { marginRight: "5px" }}>
+                {.text s!"{sugg.hint}: "}
+              </span>
+              {sugg.info?.getD (.text "")}
+              <br />
+              {.ofComponent MakeEditLink
+                (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
+                #[ .text s!"[Apply] " ]}
+              <span style={json% { paddingInline: "8px" }}>{.text "↦"}</span>
+              {.ofComponent InteractiveExpr { expr := exp } #[]}
+            </li>
+          | none => do
+            let new_line := if params.isFirst then
+              s!"{lhsStr} = {rhsStr} := by {proofStr}"
+            else
+              s!"_ = {rhsStr} := by {proofStr}"
+            let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
+            pure <li>
+              <span style={json% { marginRight: "5px" }}>
+                {.text s!"{sugg.hint}: "}
+              </span>
+              {sugg.info?.getD (.text "")}
+              <br />
+              {.ofComponent MakeEditLink
+                (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
+                #[ .text s!"[Apply]" ]}
+            </li>
       pure <p>{.text s!"Suggested next steps ({suggestions.size}):"}{ul}</p>
     return <details «open»={decide (params.goals.size > 0)}>
         <summary className="mv2 pointer">{.text "Calculator 🧮"}</summary>
