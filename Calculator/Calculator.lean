@@ -13,6 +13,52 @@ namespace Calculation
 set_option linter.style.multiGoal false
 set_option linter.style.longLine false
 set_option linter.hashCommand false
+-- set_option linter.unusedVariables false
+
+def of_inductive_ty (ty : Expr) : MetaM (Name × List (Name × Expr)) := do
+  let ty <- whnf ty
+  match ty.getAppFn with
+  | .const name us => match (<- getEnv).find? name with
+    | some (.inductInfo i) =>
+      let ctors <- i.ctors.mapM fun ctor => do
+        let cinfo <- getConstInfo ctor
+        match ctor.componentsRev with
+        | fn_name :: _ => return (fn_name, cinfo.type.instantiateLevelParams i.levelParams us)
+        | [] => throwError f!"can't figure out name for constructor: {ctor}"
+      return (name, ctors)
+    | _ => throwError "not an inductive type"
+  | _ => throwError "not a known constant type"
+
+def get_recursor (ty : Expr) : MetaM (Name × Expr × Expr) := do
+  let (ty_name, _) <- of_inductive_ty ty
+  let rec_name := Name.str ty_name "rec"
+  let rec_exp <- mkConstWithFreshMVarLevels rec_name
+  let rec_ty <- inferType rec_exp
+  return (rec_name, rec_exp, rec_ty)
+
+def match_struct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
+  matchConstStructure goal_type.getAppFn
+    (fun _ => do throwError "target {<- ppExpr goal_type} is not a structure")
+    fun ival us ctor => do
+      let sinfo := getStructureInfo (<- getEnv) ival.name
+      let fields := sinfo.fieldNames
+      let mut type <- instantiateTypeLevelParams ctor.toConstantVal us
+      let mut params : Array Expr := #[]
+      for _ in *...ctor.numParams do
+        let .forallE _ d b _ := type | throwError "unexpected constructor type"
+        let param <- mkFreshExprMVar d
+        params := params.push param
+        type := b.instantiate1 param
+      let mut field_mvars := #[]
+      for _ in fields do
+        let .forallE arg_name d b bi := type | throwError "unexpected constructor type"
+        if bi.isImplicit then throwError "unexpected implicit param {arg_name}"
+        let mvar <- mkFreshExprMVar d
+        field_mvars := field_mvars.push (arg_name, mvar)
+        type := b.instantiate1 mvar
+      if !(<- isDefEq type goal_type) then
+        throwError "oops, somehow constructed the wrong structure type {<- ppExpr type}"
+      return (params, field_mvars)
 
 def refold_def (fn within : Expr) : MetaM Expr := do
   Meta.transform within
@@ -43,6 +89,66 @@ elab (name := byDefTactic) "unroll" v:ident : tactic => Tactic.withMainContext d
   let new_goal <- goal.replaceTargetDefEq new
   Tactic.replaceMainGoal [new_goal]
 
+def stx_from_names (names : List Name) : TSyntaxArray `ident
+  := TSyntaxArray.mk <| .mk <| names.map fun n => mkIdent n
+
+def get_rec_name (n : Name) : Name := .mkSimple s!"rec.{n}"
+
+def desugar_clause_args (inp_ty : Expr) (con_args : List Name) (clause_args : List Expr)
+  : MetaM (List (Name × Expr))
+  := match con_args, clause_args with
+  | [], _ => pure []
+  | n :: ns, t :: ts => do
+    let ct <- inferType t
+    if <- isDefEq ct inp_ty then
+      let (r::rs) := ts
+        | throwError "couldn't match 'define' arguments with defining clause"
+      let rest <- desugar_clause_args inp_ty ns rs
+      return (n, t) :: (get_rec_name n, r) :: rest
+    else
+      let rest <- desugar_clause_args inp_ty ns ts
+      return (n, t) :: rest
+  | _, [] => throwError "couldn't match 'define' arguments with defining clause (too many arguments)"
+
+def desugar_clause_def
+  (clause_of : Name)
+  (clause inp_ty : Expr)
+  (con_args rest_args : List Name) -- the args for the recursor, but without the IH's
+  (to_term : TSyntax `term)
+  : Tactic.TacticM Expr := do
+  let search_fn <- elabTerm (mkIdent clause_of) none
+  let clause_ty <- inferType clause
+  let (clause_args, _, _) <- forallMetaTelescopeReducing clause_ty
+  let ns <- desugar_clause_args inp_ty con_args clause_args.toList
+  let body_args := ns.map (·.fst) ++ rest_args
+  let body_node : TSyntax `term <- `(fun $(stx_from_names body_args)* => $to_term)
+  let body_fn <- elabTerm body_node (some clause_ty)
+  Meta.transform body_fn <| fun e => do
+    -- if we find an 'e' which is an application of the function being defined...
+    if <- isDefEq e.getAppFn search_fn then
+      let ((.fvar fv)::args) := e.getAppArgs.toList
+        | throwError "can't make recursive call: {<- ppExpr e}"
+      let arg_name <- fv.getUserName
+      let rec_name := get_rec_name arg_name
+      let some idx := ns.findIdx? fun (n, _) => n = rec_name
+        | throwError "can't make recursive call to non-immediate-subterm {arg_name}"
+      let db_idx := body_args.length - idx - 1
+      let e := mkAppN (.bvar db_idx) args.toArray
+      return .done e
+    return .continue
+
+def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit := do
+  let mctx <- getMCtx
+  match mctx.findUserName? bind_name with
+  | none => throwUnknownNameWithSuggestions bind_name
+  | some mv => do
+    if (<- mv.getTag) == bind_name then do
+      if <- mv.isAssigned then
+        if !(<- isDefEq (.mvar mv) to_expr) then
+          throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n    (already assigned to {Expr.mvar mv})"
+      else
+        mv.assignIfDefEq to_expr
+
 def define_clause (bind_name : Name) (args : TSyntaxArray `ident) (to_term : TSyntax `term) : Tactic.TacticM Unit := do
   let body_node: TSyntax `term <- `(fun $args* => $to_term)
   let mctx <- getMCtx
@@ -58,90 +164,57 @@ def define_clause (bind_name : Name) (args : TSyntaxArray `ident) (to_term : TSy
       else
         mv.assignIfDefEq to_expr
 
-elab (name := defineTactic) "define" mod:("only")? v:ident args:ident* " := " to_term:term : tactic => do
+elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " to_term:term : tactic
+  => do
   define_clause v.getId args to_term
   if !mod.isSome then
     Tactic.withMainContext do
       Tactic.evalTactic (<- `(tactic| try rfl))
 
-elab "define'" p:term ":=" to_term:term : tactic => do
-  match p with
+elab (name := defineTacticSugared) "define" mod:("only")? p:term ":=" to_term:term : tactic
+  => match p with
   | `($f:ident $pat:term $rest*) => do
     let pat <- liftMacroM <| expandMacros pat
     let (con_stx, named, con_args_stx, ell) <- Term.expandApp pat
-    if !named.isEmpty || ell then throwUnsupportedSyntax
+    let con_stx <- if con_stx.isMissing
+      then pure pat
+      else if !named.isEmpty || ell then throwUnsupportedSyntax
+      else pure con_stx
     let con <- match con_stx with
-      | `($fId:ident)  => pure fId
-      | _ => throwErrorAt pat "expected a constructor application, but got {indentD pat}"
+      | `($conId:ident) => pure conId
+      | _ => throwErrorAt pat m!"expected a constructor application, but got {indentD pat}"
     let some (Expr.const (.str _ con_name) _) <- resolveId? con "pattern"
       | throwError "expected {con} to be a constructor"
     let clause_name := Name.str f.getId con_name
+    let mctx <- getMCtx
+    let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
+      | throwErrorAt f "unknown defining clause for {f}, for constructor: {con_name})"
     let con_args <- con_args_stx.mapM fun
       | .stx s => if s.isIdent then pure s else throwErrorAt s "expected an identifier"
       | _ => unreachable!
     for rv in rest do if !rv.raw.isIdent then throwErrorAt rv "expected an identifier"
-    let body_args := TSyntaxArray.mk (con_args ++ rest)
-    let body_node: TSyntax `term <- `(fun $body_args* => $to_term)
-    dbg_trace f!"con: {con_name}
-    args: {con_args_stx}
-    clause = {clause_name}
-    f = {f.getId}
-    rest: {rest}"
-    let s <- saveState
-    let main <- Tactic.getMainGoal
-    main.withContext do
-      let search_fn <- elabTerm f none
-      let fn <- elabTerm body_node none
-      let fn_ty <- inferType fn
-      _ <- Meta.transform fn (fun e => do
-        if <- isDefEq e.getAppFn search_fn then
-          dbg_trace f!"search {<- ppExpr search_fn} in sub: {<- ppExpr e}"
-        return .continue)
-      let (ms, bs, r) <- forallMetaTelescopeReducing fn_ty (some 1)
-      logInfo m!"got {ms} to {r}"
-    s.restore
-    return ()
+    let mctx <- getMCtx
+    let (some search_fn_mv) := mctx.findUserName? f.getId
+      | throwErrorAt f "the name {f} is undefined"
+    let search_ty <- search_fn_mv.getType''
+    let some (inp_ty, _) := search_ty.arrow?
+      | throwErrorAt f "cannot define a clause in non-function {f}"
+    -- construct a new function, 'fn',
+    let con_arg_names := con_args.toList.map (·.getId)
+    let rest_names <- rest.toList.mapM fun s => match s.raw with
+      | `($i:ident) => pure i.getId
+      | s => throwErrorAt s "expected an identifier"
+    let fn <- Tactic.withMainContext <| desugar_clause_def
+      f.getId clause_expr inp_ty
+      con_arg_names rest_names to_term
+    define_mv clause_name fn
+    if !mod.isSome then
+      Tactic.withMainContext do
+        Tactic.evalTactic (<- `(tactic| try rfl))
   | _ => throwUnsupportedSyntax
 
 #allow_unused_tactic! defineTactic
-
-def of_inductive_ty (ty : Expr) : MetaM (Name × List (Name × Expr)) := do
-  let ty <- whnf ty
-  match ty.getAppFn with
-  | .const name us => match (<- getEnv).find? name with
-    | some (.inductInfo i) =>
-      let ctors <- i.ctors.mapM fun ctor => do
-        let cinfo <- getConstInfo ctor
-        match ctor.componentsRev with
-        | fn_name :: _ => return (fn_name, cinfo.type.instantiateLevelParams i.levelParams us)
-        | [] => throwError f!"can't figure out name for constructor: {ctor}"
-      return (name, ctors)
-    | _ => throwError "not an inductive type"
-  | _ => throwError "not a known constant type"
-
-def match_struct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
-  matchConstStructure goal_type.getAppFn
-    (fun _ => do throwError "target {<- ppExpr goal_type} is not a structure")
-    fun ival us ctor => do
-      let sinfo := getStructureInfo (<- getEnv) ival.name
-      let fields := sinfo.fieldNames
-      let mut type <- instantiateTypeLevelParams ctor.toConstantVal us
-      let mut params : Array Expr := #[]
-      for _ in *...ctor.numParams do
-        let .forallE _ d b _ := type | throwError "unexpected constructor type"
-        let param <- mkFreshExprMVar d
-        params := params.push param
-        type := b.instantiate1 param
-      let mut field_mvars := #[]
-      for _ in fields do
-        let .forallE arg_name d b bi := type | throwError "unexpected constructor type"
-        if bi.isImplicit then throwError "unexpected implicit param {arg_name}"
-        let mvar <- mkFreshExprMVar d
-        field_mvars := field_mvars.push (arg_name, mvar)
-        type := b.instantiate1 mvar
-      if !(<- isDefEq type goal_type) then
-        throwError "oops, somehow constructed the wrong structure type {<- ppExpr type}"
-      return (params, field_mvars)
+#allow_unused_tactic! defineTacticSugared
 
 def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
   : Tactic.TacticM FVarId := do
@@ -165,9 +238,8 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
       | none => throwError m!"cannot calculate non-arrow-type {field_type} of '{field_name}'"
       | some t => pure (field_type, t)
   -- find the recursor
-  let (inp_ty_name, ctors) <- of_inductive_ty inp_ty
-  let recursor <- mkConstWithFreshMVarLevels (.str inp_ty_name "rec")
-  let rec_ty <- inferType recursor
+  let (_, ctors) <- of_inductive_ty inp_ty
+  let (_, recursor, rec_ty) <- get_recursor inp_ty
   -- make the motive (a const function)
   let motive_stx <- `(fun x => $(<- mot_ty.toSyntax))
   let motive <- elabTerm motive_stx none
@@ -232,20 +304,10 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
   Tactic.pushGoals field_mvs
-  for (field_name, as_name, fv, _) in fvs do
+  for (field_name, _, fv, _) in fvs do
     for field_mv in field_mvs do
       if (<- field_mv.getTag) == field_name then
         field_mv.assign (.fvar fv)
-        -- let t <- inferType (.mvar field_mv)
-        -- let (forall_args, _, _) <- forallMetaTelescopeReducing t
-        -- field_mv.withContext do
-          -- let lhs := mkAppN (.mvar field_mv) forall_args
-          -- let rhs <- reduce lhs
-          -- let mut eq <- mkEq lhs rhs
-          -- eq <- mkForallFVars forall_args eq
-          -- let mut proof <- mkEqRefl lhs
-          -- proof <- mkLambdaFVars forall_args proof
-          -- _ <- intro_let_in_main_goal (.str as_name "eq_def") eq proof (isDef := false)
 
 /- Things I want:
  * A nicer define syntax like:  define aux (x :: xs) ys := aux xs (x :: ys)
@@ -433,18 +495,13 @@ def correct {a} : RevSpec a := by
   intro xs
   induction xs <;> intro ys
   case nil =>
-    define aux.nil ys := ys
+    define aux [] ys := ys
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
-          --  = (rev xs ++ [x]) ++ ys := by rfl
-        --  _ = rev xs ++ ([x] ++ ys) := by rw [@append_assoc]
-        --  _ = rev xs ++ x :: ys := by dsimp only [cons_append, nil_append]
-         _ = rev xs ++ [x] ++ ys := by rfl
-         _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
-         _ = aux xs (x :: ys) := by rw [ih]
-         _ = aux (x :: xs) ys := by {}
-        --  _ = aux xs (x :: ys) := by rw [ih]
-        --  _ = aux (x :: xs) ys := by define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
+     _ = rev xs ++ [x] ++ ys := by rfl
+     _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
+     _ = aux xs (x :: ys) := by rw [ih]
+     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
 end Calculation
 end Tactic

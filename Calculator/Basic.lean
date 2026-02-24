@@ -47,23 +47,23 @@ def test2 {a} :
 #print test
 #eval test.fst [1, 2] [3, 4] [5, 6]
 
-structure RevSpec a : Type where
-  aux : List a -> List a -> List a
-  correct : ∀ xs ys, aux xs ys = rev xs ++ ys
+-- structure RevSpec a : Type where
+--   aux : List a -> List a -> List a
+--   correct : ∀ xs ys, aux xs ys = rev xs ++ ys
 
-def correct {a} : RevSpec a := by
-  calculate aux
-  intro xs
-  induction xs <;> intro ys
-  case nil =>
-    define aux.nil ys := ys
-  case cons x xs ih =>
-    rw [rev]
-    rw [List.append_assoc]
-    define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
-    unroll aux
-    rw [<- ih]
-    rw [List.cons_append, List.nil_append]
+-- def correct {a} : RevSpec a := by
+--   calculate aux
+--   intro xs
+--   induction xs <;> intro ys
+--   case nil =>
+--     define aux.nil ys := ys
+--   case cons x xs ih =>
+--     rw [rev]
+--     rw [List.append_assoc]
+--     define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
+--     unroll aux
+--     rw [<- ih]
+--     rw [List.cons_append, List.nil_append]
 
 inductive Exp : Type
   | val : Nat -> Exp
@@ -72,6 +72,7 @@ inductive Exp : Type
 
 compile_inductive% Exp
 
+@[simp]
 def eval : Exp -> Nat
   | .val n => n
   | .add x y => eval x + eval y
