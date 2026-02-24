@@ -1,5 +1,6 @@
 import Mathlib.Tactic.Common
 import Mathlib.Util.CompileInductive
+import ProofWidgets.Data.Html
 
 open Nat
 open Option
@@ -215,7 +216,6 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
   let fvs <- vs.getElems.mapM fun s => do
-    dbg_trace f!"got s = {s}"
     match s with
     | `(calc_name| $v:ident) =>
       let field_name := v.getId
@@ -236,61 +236,215 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
     for field_mv in field_mvs do
       if (<- field_mv.getTag) == field_name then
         field_mv.assign (.fvar fv)
-        let t <- inferType (.mvar field_mv)
-        let (forall_args, _, _) <- forallMetaTelescopeReducing t
-        field_mv.withContext do
-          let lhs := mkAppN (.mvar field_mv) forall_args
-          let rhs <- reduce lhs
-          let mut eq <- mkEq lhs rhs
-          eq <- mkForallFVars forall_args eq
-          let mut proof <- mkEqRefl lhs
-          proof <- mkLambdaFVars forall_args proof
-          _ <- intro_let_in_main_goal (.str as_name "eq_def") eq proof (isDef := false)
+        -- let t <- inferType (.mvar field_mv)
+        -- let (forall_args, _, _) <- forallMetaTelescopeReducing t
+        -- field_mv.withContext do
+          -- let lhs := mkAppN (.mvar field_mv) forall_args
+          -- let rhs <- reduce lhs
+          -- let mut eq <- mkEq lhs rhs
+          -- eq <- mkForallFVars forall_args eq
+          -- let mut proof <- mkEqRefl lhs
+          -- proof <- mkLambdaFVars forall_args proof
+          -- _ <- intro_let_in_main_goal (.str as_name "eq_def") eq proof (isDef := false)
 
--- def rev {a} : List a → List a
---   | [] => []
---   | x :: xs => rev xs ++ [x]
+/- Things I want:
+ * A nicer define syntax like:  define aux (x :: xs) ys := aux xs (x :: ys)
+ * A tactic to introduce the "obvious" definition
+   so if my goal is
+    aux xs (x :: ys) = aux (x :: xs) ys
+   it can figure out that this works as a definition (generalizing x :: xs)
+ * A widget to show possible things to do in a calculation proof
+-/
 
--- def test {a} :
---   Σ' aux : List a -> List a -> List a,
---   ∀ xs ys, aux xs ys = rev xs ++ ys := by
---   calculate fst
---   intro xs
---   induction xs <;> intro ys
---   case nil =>
---     rewrite [rev, List.nil_append]
---     -- define fst.cons x xs ih ys := fst
---     define' fst (x::xs) ys := fst xs (x :: ys)
---     -- define' fst (x::xs) foo bar := ys
---     -- unroll fst
---     -- rfl
---   case cons x xs ih =>
---     rewrite [rev]
---     rewrite [List.append_assoc]
---     rewrite [List.cons_append, List.nil_append]
---     rewrite [<- ih]
---     unroll fst
---     generalize fst xs = h
---     rfl
+open Server
+open ProofWidgets
+open scoped Jsx
+open SelectInsertParamsClass Lean.SubExpr
 
-def test2 {a} :
-  Σ' len : List a -> Nat,
-  len [] = 0 ∧ ∀ xs x, len (x :: xs) = len xs + 1 := by
-  calculate fst as len
-  constructor
-  · define len.nil := 0
-  · intro xs
-    induction xs
-    case cons y ys ih =>
-      intro x
-      rw [ih]
-      unroll len
-      rw [<- ih]
-      generalize len (y :: ys) = l_xs
-      define len.cons x xs l_xs := l_xs + 1
-    case nil =>
-      intro x
-      dsimp [len]
+structure CalcParams extends SelectInsertParams where
+  isFirst : Bool
+  indent : Nat
+  deriving SelectInsertParamsClass, RpcEncodable
+
+structure Suggestion where
+  hint : String
+  info? : Option Html := none
+  newLhs : Expr
+  proofStr? : Option String := none
+
+abbrev CalcSuggester := (mv : MVarId) -> (lhs : Expr) -> MetaM (Array Suggestion)
+
+def suggest_apply_hyp : CalcSuggester := fun mv lhs => do
+  let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
+  let mut suggestions : Array Suggestion := #[]
+  for i in lctx.decls do
+    let some d := i | continue
+    try
+      let r <- mv.rewrite lhs d.toExpr
+      let hyp_ty <- WithRpcRef.mk (<- ExprWithCtx.save d.type)
+      suggestions := suggestions.push {
+        hint := "Apply hypothesis"
+        info? := some
+          <span>
+            <strong className="goal-hyp">
+              {.text (toString f!"{d.userName}")}
+            </strong>
+            <span className="font-code"> : </span>
+            {.ofComponent InteractiveExpr { expr := hyp_ty } #[]}
+          </span>
+        newLhs := r.eNew
+        proofStr? := some s!"rw [{d.userName}]"
+      }
+    catch | _ => pure ()
+  return suggestions
+
+def suggest_dsimp : CalcSuggester := fun _ lhs => do
+  let simp_ctx <- mkSimpContext
+  let (lhs', stats) <- Meta.dsimp lhs simp_ctx
+  if lhs == lhs' then
+    return #[]
+  else if <- isDefEq lhs lhs' then
+    return #[{
+      hint := "Reduce"
+      newLhs := lhs'
+      proofStr? := some "rfl"
+      info? := some (.text "by reflexivity")
+    }]
+  else
+    let thms <- stats.usedTheorems.toArray.mapM fun o =>
+      toString <$> ppExpr (mkConst o.key [])
+    let thms_str := String.join (thms.toList.intersperse ", ")
+    return #[{
+      hint := "Simplify (definitional)"
+      newLhs := lhs'
+      info? := some
+        <span>
+          {.text "using "}
+          <span className="font-code">{.text thms_str}</span>
+        </span>
+      proofStr? := some s!"dsimp only [{thms_str}]"
+    }]
+
+def suggest_simp : CalcSuggester := fun _ lhs => do
+  let simp_ctx <- mkSimpContext
+  let (res, stats) <- Meta.simp lhs simp_ctx
+  let lhs' := res.expr
+  if lhs == lhs' || (<- isDefEq lhs lhs') then
+    return #[]
+  else
+    let thms <- stats.usedTheorems.toArray.mapM fun o =>
+      toString <$> ppExpr (mkConst o.key [])
+    let thms_str := String.join (thms.toList.intersperse ", ")
+    return #[{
+      hint := "Simplify"
+      newLhs := lhs'
+      info? := some
+        <span>
+          {.text "using "}
+          <span className="font-code">{.text thms_str}</span>
+        </span>
+      proofStr? := some s!"simp only [{thms_str}]"
+    }]
+
+@[server_rpc_method]
+def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
+  fun params =>
+  RequestM.withWaitFindSnapAtPos params.pos fun _ => do
+    let doc <- RequestM.readDoc
+    let body <- match params.goals.toList with
+    | [] => pure (<p>{.text "Nothing left to prove here"}</p>)
+    | main_goal :: _ => main_goal.ctx.val.runMetaM {} <| main_goal.mvarId.withContext do
+      let mv := main_goal.mvarId
+      let md <- mv.getDecl
+      let mty := md.type.consumeMData
+      let some (_, lhs, rhs) <- getCalcRelation? mty
+        | pure <p>{.text "The goal isn't an equality!"}</p>
+      let lhsStr := (toString <| <- ppExpr lhs).renameMetaVar
+      let rhsStr := (toString <| <- ppExpr rhs).renameMetaVar
+      let spc := String.replicate params.indent ' '
+      let mut suggestions : Array Suggestion
+        := (<- suggest_apply_hyp mv lhs)
+        ++ (<- suggest_dsimp mv lhs)
+        ++ (<- suggest_simp mv lhs)
+      if suggestions.isEmpty then
+        return <p>{.text "No suggestions"}</p>
+      let ul_style := json%{
+        listStyleType: "\"⚡ \"",
+        paddingLeft: "20px"
+      }
+      let ul := Html.element "ul" #[("style", ul_style)] <|
+        <- suggestions.mapM fun sugg => do
+          let exp_with_ctx <- ExprWithCtx.save sugg.newLhs
+          let exp <- WithRpcRef.mk exp_with_ctx
+          let newLhsStr := (toString <| <- ppExpr sugg.newLhs).renameMetaVar
+          let proofStr := sugg.proofStr?.getD "{}"
+          let new_line := if params.isFirst then
+            s!"{lhsStr} = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
+          else
+            s!"_ = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
+          let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
+          pure <li>
+            <span style={json% { marginRight: "5px" }}>
+              {.text s!"{sugg.hint}: "}
+            </span>
+            {sugg.info?.getD (.text "")}
+            <br />
+            {.ofComponent MakeEditLink
+              (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
+              #[ .text s!"[Apply] " ]}
+            <span style={json% { paddingInline: "8px" }}>{.text "↦"}</span>
+            {.ofComponent InteractiveExpr { expr := exp } #[]}
+          </li>
+      pure <p>{.text s!"Suggested next steps ({suggestions.size}):"}{ul}</p>
+    return <details «open»={decide (params.goals.size > 0)}>
+        <summary className="mv2 pointer">{.text "Calculator 🧮"}</summary>
+        {body}
+      </details>
+
+@[widget_module]
+def panel : Component CalcParams :=
+  mk_rpc_widget% rpc
+
+elab_rules : tactic
+| `(tactic|calc%$calcstx $steps) => do
+  let mut isFirst := true
+  for step in ← Lean.Elab.Term.mkCalcStepViews steps do
+    let some replaceRange := (<- getFileMap).lspRangeOfStx? step.ref | continue
+    let json := json% {
+      "isFirst": $(isFirst),
+      "replaceRange": $(replaceRange),
+      "indent": $(replaceRange.start.character)
+    }
+    Widget.savePanelWidgetInfo panel.javascriptHash (pure json) step.proof
+    isFirst := false
+  Tactic.evalCalc (← `(tactic|calc%$calcstx $steps))
+
+@[simp]
+def rev {a} : List a → List a
+  | [] => []
+  | x :: xs => rev xs ++ [x]
+
+structure RevSpec a : Type where
+  aux : List a -> List a -> List a
+  correct : ∀ xs ys, rev xs ++ ys = aux xs ys
+
+def correct {a} : RevSpec a := by
+  calculate aux
+  intro xs
+  induction xs <;> intro ys
+  case nil =>
+    define aux.nil ys := ys
+  case cons x xs ih =>
+    calc rev (x :: xs) ++ ys
+          --  = (rev xs ++ [x]) ++ ys := by rfl
+        --  _ = rev xs ++ ([x] ++ ys) := by rw [@append_assoc]
+        --  _ = rev xs ++ x :: ys := by dsimp only [cons_append, nil_append]
+         _ = rev xs ++ [x] ++ ys := by rfl
+         _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
+         _ = aux xs (x :: ys) := by rw [ih]
+         _ = aux (x :: xs) ys := by {}
+        --  _ = aux xs (x :: ys) := by rw [ih]
+        --  _ = aux (x :: xs) ys := by define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
 
 end Calculation
 end Tactic

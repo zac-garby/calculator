@@ -1,4 +1,5 @@
 import Calculator.Calculator
+import Mathlib.Tactic.Common
 
 open Tactic.Calculation
 
@@ -20,9 +21,28 @@ def test {a} :
   case cons x xs ih =>
     dsimp
     rewrite [<- ih]
-    by_def fst
+    unroll fst
     generalize fst xs = h
     rfl
+
+def test2 {a} :
+  Σ' len : List a -> Nat,
+  len [] = 0 ∧ ∀ xs x, len (x :: xs) = len xs + 1 := by
+  calculate fst as len
+  constructor
+  · define len.nil := 0
+  · intro xs
+    induction xs
+    case cons y ys ih =>
+      intro x
+      rw [ih]
+      unroll len
+      rw [<- ih]
+      generalize len (y :: ys) = l_xs
+      define len.cons x xs l_xs := l_xs + 1
+    case nil =>
+      intro x
+      dsimp [len]
 
 #print test
 #eval test.fst [1, 2] [3, 4] [5, 6]
@@ -41,7 +61,7 @@ def correct {a} : RevSpec a := by
     rw [rev]
     rw [List.append_assoc]
     define aux.cons x xs aux_xs ys := aux_xs (x :: ys)
-    by_def aux
+    unroll aux
     rw [<- ih]
     rw [List.cons_append, List.nil_append]
 
@@ -70,7 +90,7 @@ structure CompSpec where
   exec : Code -> Stack -> Stack
   correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
 
-def comp_calc2 : CompSpec := by
+def comp_calc_non_equational : CompSpec := by
   calculate comp, exec
   intro e
   induction e <;> intros c s
@@ -80,19 +100,23 @@ def comp_calc2 : CompSpec := by
     define comp.val n c := .push n c
   case add x y ih_x ih_y =>
     rw [eval]
-    generalize h : eval x = u at ih_x
-    generalize j : eval y = v at ih_y
-    define exec.add c' exec_c' s := match s with
-          | m :: n :: s' => exec_c' ((n + m) :: s')
-          | _ => exec_c' s
+    have h : exec c ((eval x + eval y) :: s) = exec (.add c) (eval y :: eval x :: s) := by
+      define exec.add c' exec_c' s := match s with
+            | m :: n :: s' => exec_c' ((n + m) :: s')
+            | _ => exec_c' s
+    rw [h]
+    simp only [ih_y, ih_x]
     define comp.add x y cx cy c := cx (cy (.add c))
-    by_def comp
-
+  case exec.halt =>
+    intro
+    assumption
 
 def comp_calc : CompSpec := by
   calculate comp, exec
   intro e
   induction e <;> intros c s
+  -- Define exec.halt
+  define exec.halt s := s
   -- Case val n:
   case val n => calc
         exec c (eval (.val n) :: s)
@@ -116,11 +140,28 @@ def comp_calc : CompSpec := by
         := by simp [ih_x]
     _ = exec (comp (.add x y) c) s
         := by define comp.add x y comp_x comp_y c := comp_x (comp_y (.add c))
-  -- Case halt:
-  case exec.halt =>
-    intro
-    assumption
 
 #eval comp_calc.comp (.add (.val 1) (.val 2)) .halt
 #eval comp_calc.exec (comp_calc.comp (.add (.val 1) (.val 2)) .halt) []
 #print comp_calc
+
+def comp_calc' : CompSpec := by
+  calculate comp, exec
+  intro e
+  induction e <;> intros c s
+  -- Case val n:
+  case val n => calc
+        exec c (eval (.val n) :: s)
+      = exec c (n :: s) := by rw [eval]
+    _ = exec (.push n c) s
+        := by define exec.push n c' exec_c' s := exec_c' (n :: s)
+    _ = exec (comp (.val n) c) s
+        := by define comp.val n c := .push n c
+  -- Case add x y:
+  case add x y ih_x ih_y =>
+    calc
+      exec c (eval (x.add y) :: s) = exec c ((eval x + eval y) :: s) := by sorry
+      _ = exec (.add c) (eval y :: eval x :: s) := by sorry
+      _ = exec (comp y (.add c)) (eval x :: s) := by sorry
+      _ = exec (comp (x.add y) c) s := by sorry
+  -- Case halt:
