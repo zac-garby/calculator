@@ -37,7 +37,7 @@ def get_recursor (ty : Expr) : MetaM (Name × Expr × Expr) := do
   let rec_ty <- inferType rec_exp
   return (rec_name, rec_exp, rec_ty)
 
-def match_suct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
+def match_struct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
   matchConstStructure goal_type.getAppFn
     (fun _ => do throwError "target {<- ppExpr goal_type} is not a structure")
     fun ival us ctor => do
@@ -172,12 +172,12 @@ elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " t
     Tactic.withMainContext do
       Tactic.evalTactic (<- `(tactic| try rfl))
 
-elab (name := defineTacticSugared) "define" mod:("only")? p:term ":=" to_term:term : tactic
+elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
   => match p with
   | `($f:ident $pat:term $rest*) => do
-    let mctx <- getMCtx
+    let mctx <- Tactic.withMainContext getMCtx
     let (some search_fn_mv) := mctx.findUserName? f.getId
-      | throwErrorAt f "the name {f} is undefined"
+      | throwErrorAt f "the name {f} is undefined in {mctx.decls.toList.map fun (_, b) => b.userName}"
     let search_ty <- search_fn_mv.getType''
     let some (inp_ty, _) := search_ty.arrow?
       | throwErrorAt f "cannot define a clause in non-function {f}"
@@ -283,7 +283,7 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   -- look at main goal, get its fields
   let main_goal <- Tactic.getMainGoal
   let main_type <- main_goal.getType''
-  let (_, spec_fields) <- match_suct_fields main_type
+  let (_, spec_fields) <- match_struct_fields main_type
   if vs.getElems.size == 0 then
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
@@ -304,10 +304,11 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
   Tactic.pushGoals field_mvs
-  for (field_name, _, fv, _) in fvs do
+  for (field_name, as_name, fv, _) in fvs do
     for field_mv in field_mvs do
       if (<- field_mv.getTag) == field_name then
         field_mv.assign (.fvar fv)
+        field_mv.setUserName as_name
 
 /- Things I want:
  * A nicer define syntax like:  define aux (x :: xs) ys := aux xs (x :: ys)
@@ -534,12 +535,10 @@ def correct {a} : RevSpec a := by
     define aux [] ys := ys
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
-     _ = aux (x :: xs) ys := by {}
-    --  _ = rev xs ++ [x] ++ ys := by rfl
-    --  _ = rev xs ++ [x] ++ ys := by rfl
-    --  _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
-    --  _ = aux xs (x :: ys) := by rw [ih]
-    --  _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
+     _ = rev xs ++ [x] ++ ys := by rfl
+     _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
+     _ = aux xs (x :: ys) := by rw [ih]
+     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
 end Calculation
 end Tactic
