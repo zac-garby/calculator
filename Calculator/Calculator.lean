@@ -329,7 +329,8 @@ structure CalcParams extends SelectInsertParams where
   deriving SelectInsertParamsClass, RpcEncodable
 
 @[suggest]
-def suggest_apply_hyp : CalcSuggester := fun mv lhs _ => do
+def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
+  let mv := goal.mvarId
   let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
   let mut suggestions : Array Suggestion := #[]
   for i in lctx.decls do
@@ -352,15 +353,6 @@ def suggest_apply_hyp : CalcSuggester := fun mv lhs _ => do
       }
     catch | _ => pure ()
   return suggestions
-
-@[suggest]
-def suggest_define_clause : CalcSuggester := fun mv lhs rhs => do
-  if !rhs.isApp then return #[]
-  return #[{
-    hint := "Define"
-    info? := some <span className="font-code">{.text s!"{<- ppExpr rhs} := {<- ppExpr lhs}"}</span>
-    proofStr? := s!"define {<- ppExpr rhs} := {<- ppExpr lhs}"
-  }]
 
 @[suggest]
 def suggest_dsimp : CalcSuggester := fun _ lhs _ => do
@@ -413,13 +405,26 @@ def suggest_simp : CalcSuggester := fun _ lhs _ => do
     }]
 
 @[suggest]
-def suggest_test : CalcSuggester := fun mv lhs rhs => do
-  let (mvs, s) <- runTactic mv (<- `(tactic| try rfl))
-  return #[]
+def suggest_define : CalcSuggester := fun goal lhs rhs => do
+  let mv := goal.mvarId
+  let lhs_stx <- PrettyPrinter.delab lhs
+  let rhs_stx <- PrettyPrinter.delab rhs
+  let tac <- `(tactic| define $rhs_stx := $lhs_stx)
+  let ctx <- getLCtx
+  let proof <- ContextInfo.ppSyntax goal.ctx.val ctx tac
+  let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
+  match mvs with
+    | [] => return #[{
+        hint := "Define"
+        proofStr? := some (toString proof)
+        info? := <span>{.text "Let: "} <span className="font-code">{.text s!"{<- ppExpr rhs} := LHS"}</span></span>
+      }]
+    | _ => return #[]
 
 def sep (s : String := "5px") : Html := <span style={json% { marginRight: $s }} />
 
-def unpack_calc_goal (goal_ty : Expr) : MetaM (String × Expr × String × Expr × String) := do
+def unpack_calc_goal (goal_ty : Expr)
+  : MetaM (String × Expr × String × Expr × String) := do
   let some (rel, lhs, rhs) <- Term.getCalcRelation? goal_ty
     | throwError "invalid 'calc' step, relation expected{indentD goal_ty}"
   let app := mkApp2 rel (<- mkFreshExprMVar none) (<- mkFreshExprMVar none)
@@ -430,14 +435,14 @@ def unpack_calc_goal (goal_ty : Expr) : MetaM (String × Expr × String × Expr 
   let rhs_s := (toString <| <- ppExpr rhs).renameMetaVar
   pure (rel_s, lhs, lhs_s, rhs, rhs_s)
 
-def all_suggestions : CalcSuggester := fun mv lhs rhs => do
+def all_suggestions : CalcSuggester := fun goal lhs rhs => do
   let env <- getEnv
   let sugg_names := suggester_ext.getState env
   sugg_names.foldlM (init := #[]) fun acc n => do
     let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
     let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
-    let suggs <- f mv lhs rhs
-    pure (acc ++ suggs)
+    let suggs <- f goal lhs rhs
+    pure (suggs ++ acc)
 
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
@@ -450,7 +455,7 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
       let mty <- mv.getType''
       let (rel, lhs, lhs_s, rhs, rhs_s) <- unpack_calc_goal mty
       let spc := String.replicate params.indent ' '
-      let mut suggestions <- all_suggestions mv lhs rhs
+      let mut suggestions <- all_suggestions main_goal lhs rhs
       if suggestions.isEmpty then
         return <p>{.text "No suggestions"}</p>
       let ul_style := json%{
@@ -529,8 +534,8 @@ def correct {a} : RevSpec a := by
     define aux [] ys := ys
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
-     _ = rev xs ++ [x] ++ ys := by rfl
      _ = aux (x :: xs) ys := by {}
+    --  _ = rev xs ++ [x] ++ ys := by rfl
     --  _ = rev xs ++ [x] ++ ys := by rfl
     --  _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
     --  _ = aux xs (x :: ys) := by rw [ih]

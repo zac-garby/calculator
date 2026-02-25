@@ -3,7 +3,7 @@ import ProofWidgets.Data.Html
 
 namespace Tactic.Calculation
 
-open Lean Meta ProofWidgets.Jsx ProofWidgets
+open Lean Meta ProofWidgets.Jsx ProofWidgets Server.Snapshots Server
 
 structure Suggestion where
   hint : String
@@ -11,7 +11,9 @@ structure Suggestion where
   newLhs? : Option Expr := none
   proofStr? : Option String := none
 
-abbrev CalcSuggester := (mv : MVarId) -> (lhs rhs : Expr) -> MetaM (Array Suggestion)
+abbrev CalcSuggester
+  := (goal : Widget.InteractiveGoal) -> (lhs rhs : Expr)
+  -> MetaM (Array Suggestion)
 
 initialize suggester_ext : SimplePersistentEnvExtension Name NameSet
   <- registerSimplePersistentEnvExtension {
