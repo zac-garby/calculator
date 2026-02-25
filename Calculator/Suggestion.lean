@@ -31,4 +31,13 @@ initialize registerBuiltinAttribute {
     setEnv (suggester_ext.addEntry (<- getEnv) name)
 }
 
+def all_suggestions : CalcSuggester := fun goal lhs rhs => do
+  let env <- getEnv
+  let sugg_names := suggester_ext.getState env
+  sugg_names.foldlM (init := #[]) fun acc n => do
+    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
+    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
+    let suggs <- f goal lhs rhs
+    pure (suggs ++ acc)
+
 end Tactic.Calculation

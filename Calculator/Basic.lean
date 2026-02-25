@@ -30,16 +30,13 @@ def test2 {a} :
   len [] = 0 ∧ ∀ xs x, len (x :: xs) = len xs + 1 := by
   calculate fst as len
   constructor
-  · define len.nil := 0
+  · define len [] := 0
   · intro xs
     induction xs
     case cons y ys ih =>
       intro x
       rw [ih]
-      unroll len
-      rw [<- ih]
-      generalize len (y :: ys) = l_xs
-      define len.cons x xs l_xs := l_xs + 1
+      define len (x :: xs) := len xs + 1
     case nil =>
       intro x
       dsimp [len]
@@ -122,27 +119,30 @@ def comp_calc : CompSpec := by
   define exec (.halt s) := s
   -- Case val n:
   case val n => calc
-        exec c (eval (.val n) :: s)
-      = exec c (n :: s) := by rw [eval]
-    _ = exec (.push n c) s
-        := by define exec (.push n c') s := exec c' (n :: s)
-    _ = exec (comp (.val n) c) s
-        := by define comp (.val n) c := .push n c
+    exec c (eval (Exp.val n) :: s)
+      = exec c (n :: s) := by rfl
+    _ = exec (Code.push n c) s := by define exec (Code.push n c) s := exec c (n :: s)
+    _ = exec (comp (Exp.val n) c) s := by {}
+    --   = exec c (n :: s) := by rw [eval]
+    -- _ = exec (.push n c) s
+    --     := by define exec (.push n c') s := exec c' (n :: s)
+    -- _ = exec (comp (.val n) c) s
+    --     := by define comp (.val n) c := .push n c
   -- Case add x y:
-  case add x y ih_x ih_y => calc
-        exec c (eval (.add x y) :: s)
-      = exec c ((eval x + eval y) :: s)
-        := by rw [eval]
-    _ = exec (.add c) (eval y :: eval x :: s)
-        := by define exec (.add c') s := match s with
-            | m :: n :: s' => exec c' ((n + m) :: s')
-            | _ => exec c' s
-    _ = exec (comp y (.add c)) (eval x :: s)
-        := by simp [ih_y]
-    _ = exec (comp x (comp y (.add c))) s
-        := by simp [ih_x]
-    _ = exec (comp (.add x y) c) s
-        := by define comp (.add x y) c := comp x (comp y (.add c))
+  -- case add x y ih_x ih_y => calc
+  --       exec c (eval (.add x y) :: s)
+  --     = exec c ((eval x + eval y) :: s)
+  --       := by rw [eval]
+  --   _ = exec (.add c) (eval y :: eval x :: s)
+  --       := by define exec (.add c') s := match s with
+  --           | m :: n :: s' => exec c' ((n + m) :: s')
+  --           | _ => exec c' s
+  --   _ = exec (comp y (.add c)) (eval x :: s)
+  --       := by simp [ih_y]
+  --   _ = exec (comp x (comp y (.add c))) s
+  --       := by simp [ih_x]
+  --   _ = exec (comp (.add x y) c) s
+  --       := by define comp (.add x y) c := comp x (comp y (.add c))
 
 #eval comp_calc.comp (.add (.val 1) (.val 2)) .halt
 #eval comp_calc.exec (comp_calc.comp (.add (.val 1) (.val 2)) .halt) []

@@ -324,10 +324,16 @@ open ProofWidgets
 open Jsx
 open SelectInsertParamsClass Lean.SubExpr
 
+def sep (s : String := "5px") : Html := <span style={json% { marginRight: $s }} />
+
 structure CalcParams extends SelectInsertParams where
   isFirst : Bool
   indent : Nat
   deriving SelectInsertParamsClass, RpcEncodable
+
+def expr_component (e : Expr) : MetaM Html := do
+  let e' <- WithRpcRef.mk (<- ExprWithCtx.save e)
+  return .ofComponent InteractiveExpr { expr := e' } #[]
 
 @[suggest]
 def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
@@ -338,7 +344,6 @@ def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
     let some d := i | continue
     try
       let r <- mv.rewrite lhs d.toExpr
-      let hyp_ty <- WithRpcRef.mk (<- ExprWithCtx.save d.type)
       suggestions := suggestions.push {
         hint := "Apply hypothesis"
         info? := some
@@ -347,7 +352,7 @@ def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
               {.text (toString f!"{d.userName}")}
             </strong>
             <span className="font-code"> : </span>
-            {.ofComponent InteractiveExpr { expr := hyp_ty } #[]}
+            {<- expr_component d.type}
           </span>
         newLhs? := r.eNew
         proofStr? := some s!"rw [{d.userName}]"
@@ -411,18 +416,39 @@ def suggest_define : CalcSuggester := fun goal lhs rhs => do
   let lhs_stx <- PrettyPrinter.delab lhs
   let rhs_stx <- PrettyPrinter.delab rhs
   let tac <- `(tactic| define $rhs_stx := $lhs_stx)
+  let save <- Meta.saveState
   let ctx <- getLCtx
   let proof <- ContextInfo.ppSyntax goal.ctx.val ctx tac
   let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
+  save.restore
   match mvs with
     | [] => return #[{
         hint := "Define"
         proofStr? := some (toString proof)
-        info? := <span>{.text "Let: "} <span className="font-code">{.text s!"{<- ppExpr rhs} := LHS"}</span></span>
+        info? := <span className="font-code">
+          {<- expr_component rhs}<br />
+          {sep "8px"}{.text ":="}{sep "8px"}
+          {<- expr_component lhs}
+        </span>
       }]
     | _ => return #[]
 
-def sep (s : String := "5px") : Html := <span style={json% { marginRight: $s }} />
+@[suggest]
+def suggest_cong : CalcSuggester := fun goal lhs rhs => do
+  let (lfn, largs) := lhs.getAppFnArgs
+  let (rfn, rargs) := rhs.getAppFnArgs
+  if lfn = rfn && largs.size = rargs.size then
+    try_cong goal lfn (Array.zip largs rargs).toList
+  else
+    return #[]
+  where
+    pairwise_eq := fun (l, r) => pure (l == r) -- withNewMCtxDepth (isDefEq l r)
+    try_cong (goal) (_fn : Name) (args : List (Expr × Expr)) : MetaM (Array Suggestion) := do
+      let (_, (l, r) :: post) <- args.partitionM pairwise_eq
+        | do return #[] -- in this case, all args already equal...
+      if !(<- post.allM pairwise_eq) then
+        return #[]
+      all_suggestions goal l r
 
 def unpack_calc_goal (goal_ty : Expr)
   : MetaM (String × Expr × String × Expr × String) := do
@@ -435,15 +461,6 @@ def unpack_calc_goal (goal_ty : Expr)
   let lhs_s := (toString <| <- ppExpr lhs).renameMetaVar
   let rhs_s := (toString <| <- ppExpr rhs).renameMetaVar
   pure (rel_s, lhs, lhs_s, rhs, rhs_s)
-
-def all_suggestions : CalcSuggester := fun goal lhs rhs => do
-  let env <- getEnv
-  let sugg_names := suggester_ext.getState env
-  sugg_names.foldlM (init := #[]) fun acc n => do
-    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
-    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
-    let suggs <- f goal lhs rhs
-    pure (suggs ++ acc)
 
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
@@ -481,7 +498,7 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
             let new_line := if params.isFirst
               then s!"{lhs_s} {rel} {rhs_s} := by {proof_s}"
               else s!"_ {rel} {rhs_s} := by {proof_s}"
-            pure (new_line, .text "(unify LHS and RHS)")
+            pure (new_line, .text "(closes this goal)")
         let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
         pure <li style={json% { marginBottom: "10px" }}>
           {.ofComponent MakeEditLink
@@ -490,9 +507,9 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
                 {.text s!"[{sugg.hint}] "}
               </span>]}
           {content}
-          <br />
-          <span style={json% { marginRight: "5px" }}></span>
-          {sugg.info?.getD (.text "")}
+          <infobox style={json% { display: "block", marginLeft: "8px", marginTop: "8px" }}>
+            {sugg.info?.getD (.text "")}
+          </infobox>
         </li>
       pure <p>{.text s!"Suggested next steps:"}{ul}</p>
     return <details «open»={decide (params.goals.size > 0)}>
@@ -539,6 +556,46 @@ def correct {a} : RevSpec a := by
      _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
      _ = aux xs (x :: ys) := by rw [ih]
      _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
+    --  _ = aux (x :: xs) ys := by {}
+
+inductive Exp : Type
+  | val : Nat -> Exp
+  | add : Exp -> Exp -> Exp
+  deriving BEq
+
+compile_inductive% Exp
+
+@[simp]
+def eval : Exp -> Nat
+  | .val n => n
+  | .add x y => eval x + eval y
+
+inductive Code where
+  | push : Nat -> Code -> Code
+  | add : Code -> Code
+  | halt : Code
+
+compile_inductive% Code
+
+abbrev Stack := List Nat
+
+structure CompSpec where
+  comp : Exp -> Code -> Code
+  exec : Code -> Stack -> Stack
+  correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
+
+def comp_calc : CompSpec := by
+  calculate comp, exec
+  intro e
+  induction e <;> intros c s
+  -- Define exec.halt
+  define exec (.halt s) := s
+  -- Case val n:
+  case val n => calc
+    exec c (eval (Exp.val n) :: s)
+      = exec c (n :: s) := by rfl
+    _ = exec (comp (Exp.val n) c) s := by {}
+    -- _ = exec (Code.push n c) s := by define exec (Code.push n c) s := exec c (n :: s)
 
 end Calculation
 end Tactic
