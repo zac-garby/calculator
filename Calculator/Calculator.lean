@@ -1,5 +1,6 @@
 import Mathlib.Tactic.Common
 import Mathlib.Util.CompileInductive
+import Calculator.Suggestion
 import ProofWidgets.Data.Html
 
 open Nat
@@ -36,7 +37,7 @@ def get_recursor (ty : Expr) : MetaM (Name × Expr × Expr) := do
   let rec_ty <- inferType rec_exp
   return (rec_name, rec_exp, rec_ty)
 
-def match_struct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
+def match_suct_fields (goal_type : Expr) : TermElabM (Array Expr × Array (Name × Expr)) := do
   matchConstStructure goal_type.getAppFn
     (fun _ => do throwError "target {<- ppExpr goal_type} is not a structure")
     fun ival us ctor => do
@@ -282,7 +283,7 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   -- look at main goal, get its fields
   let main_goal <- Tactic.getMainGoal
   let main_type <- main_goal.getType''
-  let (_, spec_fields) <- match_struct_fields main_type
+  let (_, spec_fields) <- match_suct_fields main_type
   if vs.getElems.size == 0 then
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
@@ -319,7 +320,7 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
 
 open Server
 open ProofWidgets
-open scoped Jsx
+open Jsx
 open SelectInsertParamsClass Lean.SubExpr
 
 structure CalcParams extends SelectInsertParams where
@@ -327,14 +328,7 @@ structure CalcParams extends SelectInsertParams where
   indent : Nat
   deriving SelectInsertParamsClass, RpcEncodable
 
-structure Suggestion where
-  hint : String
-  info? : Option Html := none
-  newLhs? : Option Expr := none
-  proofStr? : Option String := none
-
-abbrev CalcSuggester := (mv : MVarId) -> (lhs rhs : Expr) -> MetaM (Array Suggestion)
-
+@[suggest]
 def suggest_apply_hyp : CalcSuggester := fun mv lhs _ => do
   let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
   let mut suggestions : Array Suggestion := #[]
@@ -359,6 +353,7 @@ def suggest_apply_hyp : CalcSuggester := fun mv lhs _ => do
     catch | _ => pure ()
   return suggestions
 
+@[suggest]
 def suggest_define_clause : CalcSuggester := fun mv lhs rhs => do
   if !rhs.isApp then return #[]
   return #[{
@@ -367,6 +362,7 @@ def suggest_define_clause : CalcSuggester := fun mv lhs rhs => do
     proofStr? := s!"define {<- ppExpr rhs} := {<- ppExpr lhs}"
   }]
 
+@[suggest]
 def suggest_dsimp : CalcSuggester := fun _ lhs _ => do
   let simp_ctx <- mkSimpContext
   let (lhs', stats) <- Meta.dsimp lhs simp_ctx
@@ -382,18 +378,19 @@ def suggest_dsimp : CalcSuggester := fun _ lhs _ => do
   else
     let thms <- stats.usedTheorems.toArray.mapM fun o =>
       toString <$> ppExpr (mkConst o.key [])
-    let thms_str := String.join (thms.toList.intersperse ", ")
+    let thms_s := String.join (thms.toList.intersperse ", ")
     return #[{
       hint := "Simplify (definitional)"
       newLhs? := lhs'
       info? := some
         <span>
           {.text "using "}
-          <span className="font-code">{.text thms_str}</span>
+          <span className="font-code">{.text thms_s}</span>
         </span>
-      proofStr? := some s!"dsimp only [{thms_str}]"
+      proofStr? := some s!"dsimp only [{thms_s}]"
     }]
 
+@[suggest]
 def suggest_simp : CalcSuggester := fun _ lhs _ => do
   let simp_ctx <- mkSimpContext
   let (res, stats) <- Meta.simp lhs simp_ctx
@@ -403,87 +400,95 @@ def suggest_simp : CalcSuggester := fun _ lhs _ => do
   else
     let thms <- stats.usedTheorems.toArray.mapM fun o =>
       toString <$> ppExpr (mkConst o.key [])
-    let thms_str := String.join (thms.toList.intersperse ", ")
+    let thms_s := String.join (thms.toList.intersperse ", ")
     return #[{
       hint := "Simplify"
       newLhs? := lhs'
       info? := some
         <span>
           {.text "using "}
-          <span className="font-code">{.text thms_str}</span>
+          <span className="font-code">{.text thms_s}</span>
         </span>
-      proofStr? := some s!"simp only [{thms_str}]"
+      proofStr? := some s!"simp only [{thms_s}]"
     }]
+
+@[suggest]
+def suggest_test : CalcSuggester := fun mv lhs rhs => do
+  let (mvs, s) <- runTactic mv (<- `(tactic| try rfl))
+  return #[]
+
+def sep (s : String := "5px") : Html := <span style={json% { marginRight: $s }} />
+
+def unpack_calc_goal (goal_ty : Expr) : MetaM (String × Expr × String × Expr × String) := do
+  let some (rel, lhs, rhs) <- Term.getCalcRelation? goal_ty
+    | throwError "invalid 'calc' step, relation expected{indentD goal_ty}"
+  let app := mkApp2 rel (<- mkFreshExprMVar none) (<- mkFreshExprMVar none)
+  let app_s <- ppExpr app <&> toString
+  let some rel_s := (app_s |>.splitOn)[1]?
+    | throwError "couldn't find relation symbol in {app}"
+  let lhs_s := (toString <| <- ppExpr lhs).renameMetaVar
+  let rhs_s := (toString <| <- ppExpr rhs).renameMetaVar
+  pure (rel_s, lhs, lhs_s, rhs, rhs_s)
+
+def all_suggestions : CalcSuggester := fun mv lhs rhs => do
+  let env <- getEnv
+  let sugg_names := suggester_ext.getState env
+  sugg_names.foldlM (init := #[]) fun acc n => do
+    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
+    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
+    let suggs <- f mv lhs rhs
+    pure (acc ++ suggs)
 
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
-  fun params =>
-  RequestM.withWaitFindSnapAtPos params.pos fun snap => do
+  fun params => RequestM.withWaitFindSnapAtPos params.pos fun _snap => do
     let doc <- RequestM.readDoc
     let body <- match params.goals.toList with
     | [] => pure (<p>{.text "Nothing left to prove here"}</p>)
     | main_goal :: _ => main_goal.ctx.val.runMetaM {} <| main_goal.mvarId.withContext do
       let mv := main_goal.mvarId
-      let md <- mv.getDecl
-      let mty := md.type.consumeMData
-      let some (_, lhs, rhs) <- getCalcRelation? mty
-        | pure <p>{.text "The goal isn't an equality!"}</p>
-      let lhsStr := (toString <| <- ppExpr lhs).renameMetaVar
-      let rhsStr := (toString <| <- ppExpr rhs).renameMetaVar
+      let mty <- mv.getType''
+      let (rel, lhs, lhs_s, rhs, rhs_s) <- unpack_calc_goal mty
       let spc := String.replicate params.indent ' '
-      let mut suggestions : Array Suggestion
-        := (<- suggest_apply_hyp mv lhs rhs)
-        ++ (<- suggest_dsimp mv lhs rhs)
-        ++ (<- suggest_simp mv lhs rhs)
-        ++ (<- suggest_define_clause mv lhs rhs)
+      let mut suggestions <- all_suggestions mv lhs rhs
       if suggestions.isEmpty then
         return <p>{.text "No suggestions"}</p>
       let ul_style := json%{
         listStyleType: "\"⚡ \"",
         paddingLeft: "20px"
       }
-      let ul := Html.element "ul" #[("style", ul_style)] <|
-        <- suggestions.mapM fun sugg => do
-          let proofStr := sugg.proofStr?.getD "{}"
-          match sugg.newLhs? with
-          | some newLhs => do
-            let exp_with_ctx <- ExprWithCtx.save newLhs
-            let exp <- WithRpcRef.mk exp_with_ctx
-            let newLhsStr := (toString <| <- ppExpr newLhs).renameMetaVar
-            let new_line := if params.isFirst then
-              s!"{lhsStr} = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
-            else
-              s!"_ = {newLhsStr} := by {proofStr}\n{spc}_ = {rhsStr} := by \{}"
-            let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
-            pure <li>
-              <span style={json% { marginRight: "5px" }}>
-                {.text s!"{sugg.hint}: "}
-              </span>
-              {sugg.info?.getD (.text "")}
-              <br />
-              {.ofComponent MakeEditLink
-                (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
-                #[ .text s!"[Apply] " ]}
-              <span style={json% { paddingInline: "8px" }}>{.text "↦"}</span>
-              {.ofComponent InteractiveExpr { expr := exp } #[]}
-            </li>
+      let ul <- Html.element "ul" #[("style", ul_style)] <$> suggestions.mapM fun sugg => do
+        let proof_s := sugg.proofStr?.getD "{}"
+        let (new_line, content) <- match sugg.newLhs? with
+          | some lhs' => do
+            let exp <- ExprWithCtx.save lhs' >>= (WithRpcRef.mk ·)
+            let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
+            let new_line := if params.isFirst
+              then s!"{lhs_s} {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+              else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+            pure (new_line,
+              <span>
+                {.text "LHS"}{sep "8px"}{.text "↦"}{sep "8px"}
+                {Html.ofComponent InteractiveExpr { expr := exp } #[]}
+              </span>)
           | none => do
-            let new_line := if params.isFirst then
-              s!"{lhsStr} = {rhsStr} := by {proofStr}"
-            else
-              s!"_ = {rhsStr} := by {proofStr}"
-            let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
-            pure <li>
-              <span style={json% { marginRight: "5px" }}>
-                {.text s!"{sugg.hint}: "}
-              </span>
-              {sugg.info?.getD (.text "")}
-              <br />
-              {.ofComponent MakeEditLink
-                (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
-                #[ .text s!"[Apply]" ]}
-            </li>
-      pure <p>{.text s!"Suggested next steps ({suggestions.size}):"}{ul}</p>
+            let new_line := if params.isFirst
+              then s!"{lhs_s} {rel} {rhs_s} := by {proof_s}"
+              else s!"_ {rel} {rhs_s} := by {proof_s}"
+            pure (new_line, .text "(unify LHS and RHS)")
+        let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
+        pure <li style={json% { marginBottom: "10px" }}>
+          {.ofComponent MakeEditLink
+            (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
+            #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
+                {.text s!"[{sugg.hint}] "}
+              </span>]}
+          {content}
+          <br />
+          <span style={json% { marginRight: "5px" }}></span>
+          {sugg.info?.getD (.text "")}
+        </li>
+      pure <p>{.text s!"Suggested next steps:"}{ul}</p>
     return <details «open»={decide (params.goals.size > 0)}>
         <summary className="mv2 pointer">{.text "Calculator 🧮"}</summary>
         {body}
@@ -525,9 +530,11 @@ def correct {a} : RevSpec a := by
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
      _ = rev xs ++ [x] ++ ys := by rfl
-     _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
-     _ = aux xs (x :: ys) := by rw [ih]
-     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
+     _ = aux (x :: xs) ys := by {}
+    --  _ = rev xs ++ [x] ++ ys := by rfl
+    --  _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
+    --  _ = aux xs (x :: ys) := by rw [ih]
+    --  _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
 end Calculation
 end Tactic
