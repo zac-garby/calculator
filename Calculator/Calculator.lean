@@ -35,7 +35,7 @@ namespace Calculation
 set_option linter.style.multiGoal false
 set_option linter.style.longLine false
 set_option linter.hashCommand false
--- set_option linter.unusedVariables false
+set_option linter.unusedVariables false
 
 macro "don't" "care" : term => `(panic! "found that we do actually care")
 
@@ -200,9 +200,41 @@ def count_implicit_args (ty : Expr) : Nat := match ty with
   | .lam _ _ b .implicit => 1 + count_implicit_args b
   | _ => 0
 
+def collect_pattern_ids (stx : Syntax) : Array Name :=
+  match stx with
+  | .ident _ _ name _ => #[name]
+  | .node _ _ args =>
+    args.foldl (init := #[]) fun acc s =>
+      acc ++ collect_pattern_ids s
+  | _ => #[]
+
+partial def get_id (stx : Syntax) : Option Name := match stx.getKind with
+  | `ident => pure stx.getId
+  | ``Lean.Parser.Term.dotIdent => get_id stx[1]
+  | ``Lean.Parser.Term.explicit => get_id stx[1]
+  | ``Lean.Parser.Term.hole => some (.str .anonymous "_")
+  | _ => none
+
+def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
+  let (stx', s) ← (CollectPatternVars.collect stx).run {}
+  if let some fn := get_id stx' then
+    return (stx', #[])
+  else if stx'.getKind == ``Lean.Parser.Term.app then
+    let (fn, #[], args, false) <- expandApp stx'
+      | throwErrorAt stx "invalid constructor application here"
+    let arg_names <- args.mapM fun
+      | .stx s => match get_id s with
+        | some name => pure name
+        | none => throwErrorAt s "unexpected non-ident constructor argument: {s.getKind}"
+      | _ => unreachable!
+    return (fn, arg_names)
+  else
+    throwErrorAt stx "unexpected syntax in pattern: {stx'.getKind.toString}"
+
 elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
   => match p with
   | `($f:ident $pat:term $rest*) => do
+    let main_goal <- Tactic.withMainContext Tactic.getMainGoal
     let mctx <- Tactic.withMainContext getMCtx
     let (some search_fn_mv) := mctx.findUserName? f.getId
       | throwErrorAt f "the name {f} is undefined in {mctx.decls.toList.map fun (_, b) => b.userName}"
@@ -212,18 +244,15 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     -- expand out the constructor argument's pattern to figure out the name
     -- of the constructor and its (explicit) arguments
     let pat <- liftMacroM <| expandMacros pat
-    let pat_exp <- elabPattern (.mk pat) (some inp_ty)
-    let (pat_fn, pat_args) := pat_exp.getAppFnArgs
-    let some con_info := (<- getEnv).find? pat_fn
-      | throwErrorAt pat "unknown constructor with name: {pat_fn}"
-    let num_implicit := count_implicit_args con_info.type
-    let con_args := pat_args.drop num_implicit
-    let clause_name <- match pat_fn with
+    let (con_stx, con_arg_names) <- collect_ctor_pattern pat
+    let con <- elabTerm con_stx (some inp_ty)
+    let con_ty <- inferType con
+    let num_implicit := count_implicit_args con_ty
+    let con_arg_names := con_arg_names.drop num_implicit
+    let (con_fn, _) := con.getAppFnArgs
+    let clause_name <- match con_fn with
     | .str _ con_name => pure (Name.str f.getId con_name)
-    | _ => throwErrorAt pat "expected a constructor, but got {indentD pat}"
-    let con_arg_names <- con_args.toList.mapM fun
-      | .fvar fv => fv.getUserName
-      | _ => throwErrorAt pat "expected an ident (further matching on constructor arguments is not allowed yet)"
+    | _ => throwErrorAt pat "expected a constructor, but got {con_fn}"
     let mctx <- getMCtx
     let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
       | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat})"
@@ -233,10 +262,10 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     -- construct a new function, 'fn', to define as the body
     let fn <- Tactic.withMainContext <| desugar_clause_def
       f.getId clause_expr inp_ty
-      con_arg_names rest_names to_term
+      con_arg_names.toList rest_names to_term
     define_mv clause_name fn
     if !mod.isSome then
-      Tactic.withMainContext do
+      main_goal.withContext do
         Tactic.evalTactic (<- `(tactic| try rfl))
   | _ => throwUnsupportedSyntax
 

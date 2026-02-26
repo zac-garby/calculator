@@ -5,6 +5,11 @@ open Tactic.Calculation
 
 set_option linter.style.multiGoal false
 
+structure Data where
+  ctors : List (String × List Type)
+
+
+
 def rev {a} : List a → List a
   | [] => []
   | x :: xs => rev xs ++ [x]
@@ -36,7 +41,7 @@ def test2 {a} :
     case cons y ys ih =>
       intro x
       rw [ih]
-      define len (x :: xs) := len xs + 1
+      define len (u :: us) := len us + 1
     case nil =>
       intro x
       dsimp [len]
@@ -134,7 +139,7 @@ def comp_calc : CompSpec := by
             | _ => don't care
     _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
     _ = exec (comp (.add x y) c) s
-      := by define comp (x.add y) c := comp x (comp y c.add)
+      := by define comp (.add x y) c := comp x (comp y c.add)
 
 #eval comp_calc.comp (.add (.val 1) (.val 2)) .halt
 #eval comp_calc.exec (comp_calc.comp (.add (.val 1) (.val 2)) .halt) []
