@@ -120,29 +120,21 @@ def comp_calc : CompSpec := by
   -- Case val n:
   case val n => calc
     exec c (eval (Exp.val n) :: s)
-      = exec c (n :: s) := by rfl
-    _ = exec (Code.push n c) s := by define exec (Code.push n c) s := exec c (n :: s)
-    _ = exec (comp (Exp.val n) c) s := by {}
-    --   = exec c (n :: s) := by rw [eval]
-    -- _ = exec (.push n c) s
-    --     := by define exec (.push n c') s := exec c' (n :: s)
-    -- _ = exec (comp (.val n) c) s
-    --     := by define comp (.val n) c := .push n c
-  -- Case add x y:
-  -- case add x y ih_x ih_y => calc
-  --       exec c (eval (.add x y) :: s)
-  --     = exec c ((eval x + eval y) :: s)
-  --       := by rw [eval]
-  --   _ = exec (.add c) (eval y :: eval x :: s)
-  --       := by define exec (.add c') s := match s with
-  --           | m :: n :: s' => exec c' ((n + m) :: s')
-  --           | _ => exec c' s
-  --   _ = exec (comp y (.add c)) (eval x :: s)
-  --       := by simp [ih_y]
-  --   _ = exec (comp x (comp y (.add c))) s
-  --       := by simp [ih_x]
-  --   _ = exec (comp (.add x y) c) s
-  --       := by define comp (.add x y) c := comp x (comp y (.add c))
+    _ = exec c (n :: s) := by rfl
+    _ = exec (Code.push n c) s
+      := by define exec (Code.push n c) s := exec c (n :: s)
+    _ = exec (comp (Exp.val n) c) s
+      := by define comp (Exp.val n) c := Code.push n c
+  case add x y ih_x ih_y => calc
+    exec c (eval (.add x y) :: s)
+      = exec c ((eval x + eval y) :: s) := by rfl
+    _ = exec (.add c) (eval y :: eval x :: s)
+      := by define exec (.add c') s := match s with
+            | m :: n :: s' => exec c' ((n + m) :: s')
+            | _ => don't care
+    _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
+    _ = exec (comp (.add x y) c) s
+      := by define comp (x.add y) c := comp x (comp y c.add)
 
 #eval comp_calc.comp (.add (.val 1) (.val 2)) .halt
 #eval comp_calc.exec (comp_calc.comp (.add (.val 1) (.val 2)) .halt) []

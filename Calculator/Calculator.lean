@@ -11,10 +11,33 @@ open Lean Meta Elab Term Macro Command
 namespace Tactic
 namespace Calculation
 
+/- Things I want:
+
+* 'define' tactic support for constructors with dotted constructors e.g.
+    define comp (x.add y) := ...
+
+* 'define' tactic support for pattern matching in non-constructor arguments e.g.
+    define exec (.add c') (m :: n :: s) := exec c' ((n + m) :: s)
+
+* let the define suggester discover definitions which are more general, and
+  require us to abstract from terms, e.g
+    exec c ((eval x + eval y) :: s) = exec c.add (eval y :: eval x :: s)
+      can be solved by
+    exec c ((m + n) :: s) = exec c.add (n :: m :: s)
+
+* calculating data-types!
+    probably have to be 'pseudo'-types, as data themselves
+
+* better errorrs for e.g. (ys is not defined as an argument)
+    define aux (x :: xs) s := aux xs (x :: ys)
+-/
+
 set_option linter.style.multiGoal false
 set_option linter.style.longLine false
 set_option linter.hashCommand false
 -- set_option linter.unusedVariables false
+
+macro "don't" "care" : term => `(panic! "found that we do actually care")
 
 def of_inductive_ty (ty : Expr) : MetaM (Name × List (Name × Expr)) := do
   let ty <- whnf ty
@@ -172,6 +195,11 @@ elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " t
     Tactic.withMainContext do
       Tactic.evalTactic (<- `(tactic| try rfl))
 
+def count_implicit_args (ty : Expr) : Nat := match ty with
+  | .forallE _ _ b .implicit => 1 + count_implicit_args b
+  | .lam _ _ b .implicit => 1 + count_implicit_args b
+  | _ => 0
+
 elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
   => match p with
   | `($f:ident $pat:term $rest*) => do
@@ -181,29 +209,28 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     let search_ty <- search_fn_mv.getType''
     let some (inp_ty, _) := search_ty.arrow?
       | throwErrorAt f "cannot define a clause in non-function {f}"
+    -- expand out the constructor argument's pattern to figure out the name
+    -- of the constructor and its (explicit) arguments
     let pat <- liftMacroM <| expandMacros pat
-    let (con_stx, named, con_args_stx, ell) <- Term.expandApp pat
-    let con_stx <- if con_stx.isMissing
-      then pure pat
-      else if !named.isEmpty || ell then throwUnsupportedSyntax
-      else pure con_stx
-    let con_exp <- elabPattern (.mk con_stx) (some inp_ty)
-    let con_name <- match con_exp.getAppFn with
-    | .const (.str _ con_name) _ => pure con_name
-    | e => throwError "expected a constructor, but got {indentD pat} (application with {<- ppExpr e})"
-    let clause_name := Name.str f.getId con_name
+    let pat_exp <- elabPattern (.mk pat) (some inp_ty)
+    let (pat_fn, pat_args) := pat_exp.getAppFnArgs
+    let some con_info := (<- getEnv).find? pat_fn
+      | throwErrorAt pat "unknown constructor with name: {pat_fn}"
+    let num_implicit := count_implicit_args con_info.type
+    let con_args := pat_args.drop num_implicit
+    let clause_name <- match pat_fn with
+    | .str _ con_name => pure (Name.str f.getId con_name)
+    | _ => throwErrorAt pat "expected a constructor, but got {indentD pat}"
+    let con_arg_names <- con_args.toList.mapM fun
+      | .fvar fv => fv.getUserName
+      | _ => throwErrorAt pat "expected an ident (further matching on constructor arguments is not allowed yet)"
     let mctx <- getMCtx
     let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
       | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat})"
-    let con_args <- con_args_stx.mapM fun
-      | .stx s => if s.isIdent then pure s else throwErrorAt s "expected an identifier"
-      | _ => unreachable!
-    for rv in rest do if !rv.raw.isIdent then throwErrorAt rv "expected an identifier"
-    -- construct a new function, 'fn',
-    let con_arg_names := con_args.toList.map (·.getId)
     let rest_names <- rest.toList.mapM fun s => match s.raw with
       | `($i:ident) => pure i.getId
-      | s => throwErrorAt s "expected an identifier"
+      | s => throwErrorAt s "expected an ident (matching on 'define' arguments is not allowed yet)"
+    -- construct a new function, 'fn', to define as the body
     let fn <- Tactic.withMainContext <| desugar_clause_def
       f.getId clause_expr inp_ty
       con_arg_names rest_names to_term
@@ -309,15 +336,6 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
       if (<- field_mv.getTag) == field_name then
         field_mv.assign (.fvar fv)
         field_mv.setUserName as_name
-
-/- Things I want:
- * A nicer define syntax like:  define aux (x :: xs) ys := aux xs (x :: ys)
- * A tactic to introduce the "obvious" definition
-   so if my goal is
-    aux xs (x :: ys) = aux (x :: xs) ys
-   it can figure out that this works as a definition (generalizing x :: xs)
- * A widget to show possible things to do in a calculation proof
--/
 
 open Server
 open ProofWidgets
@@ -677,57 +695,11 @@ def correct {a} : RevSpec a := by
     define aux [] ys := ys
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
-     _ = aux (x :: xs) ys := by {}
-    --  _ = rev xs ++ [x] ++ ys := by rfl
-    --  _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
-    --  _ = aux xs (x :: ys) := by rw [ih]
-    --  _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
+     _ = rev xs ++ [x] ++ ys := by rfl
+     _ = rev xs ++ x :: ys
+      := by simp only [append_assoc, cons_append, nil_append]
+     _ = aux xs (x :: ys) := by rw [ih]
+     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
-inductive Exp : Type
-  | val : Nat -> Exp
-  | add : Exp -> Exp -> Exp
-  deriving BEq
-
-compile_inductive% Exp
-
-@[simp]
-def eval : Exp -> Nat
-  | .val n => n
-  | .add x y => eval x + eval y
-
-inductive Code where
-  | push : Nat -> Code -> Code
-  | add : Code -> Code
-  | halt : Code
-
-compile_inductive% Code
-
-abbrev Stack := List Nat
-
-structure CompSpec where
-  comp : Exp -> Code -> Code
-  exec : Code -> Stack -> Stack
-  correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
-
-def comp_calc : CompSpec := by
-  calculate comp, exec
-  intro e
-  induction e <;> intros c s
-  -- Define exec.halt
-  define exec (.halt s) := s
-  -- Case val n:
-  case val n => calc
-    exec c (eval (Exp.val n) :: s)
-    _ = exec c (n :: s) := by rfl
-    _ = exec (Code.push n c) s
-      := by define exec (Code.push n c) s := exec c (n :: s)
-    _ = exec (comp (Exp.val n) c) s
-      := by define comp (Exp.val n) c := Code.push n c
-  case add x y ih_x ih_y => calc
-    exec c (eval (.add x y) :: s)
-      = exec c ((eval x + eval y) :: s) := by rfl
-    _ = exec (.add c) (eval y :: eval x :: s) := by {}
-    _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
-    _ = exec (comp (.add x y) c) s := by define comp (.add x y) c := comp x (comp y c.add)
 end Calculation
 end Tactic
