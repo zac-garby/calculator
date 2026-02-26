@@ -207,7 +207,6 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     let fn <- Tactic.withMainContext <| desugar_clause_def
       f.getId clause_expr inp_ty
       con_arg_names rest_names to_term
-    dbg_trace f!"got fn: {<- ppExpr fn}"
     define_mv clause_name fn
     if !mod.isSome then
       Tactic.withMainContext do
@@ -347,6 +346,15 @@ def expr_component (e : Expr) : MetaM Html := do
     return .ofComponent InteractiveExpr { expr := e' } #[]
 
 @[suggest]
+def suggest_already_eq : CalcSuggester := fun _goal _params lhs rhs => do
+  if <- withNewMCtxDepth (isDefEq lhs rhs) then
+    return #[{
+      hint := "Already equal"
+    }]
+  else
+    return #[]
+
+@[suggest]
 def suggest_apply_hyp : CalcSuggester := fun goal _params lhs _ => do
   let mv := goal.mvarId
   let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
@@ -479,15 +487,19 @@ def unpack_calc_goal (goal_ty : Expr)
   pure (rel_s, lhs, lhs_s, rhs, rhs_s)
 
 def wrap_new_step_str (str indent : String) : String :=
-  let lines := str.lines
-  let lines' := lines.toList.flatMap fun line =>
-    if line.positions.length > 95 then
-      match line |>.split ":=" |>.toList with
-        | (step::rest) => [step, indent ++ "  :=" ++ String.intercalate ":=" (rest.map (·.toString))]
-        | _ => [line]
-    else
-      [line]
-  String.intercalate "\n" (lines'.map (·.toString))
+  if str.isEmpty then
+    str
+  else
+    let lines := str.lines
+    let ind_len := indent.length
+    let lines' := lines.toList.flatMap fun line =>
+      if ind_len + line.positions.length > 80 then
+        match line |>.split ":=" |>.toList with
+          | (step::rest) => [step, indent ++ "  :=" ++ String.intercalate ":=" (rest.map (·.toString))]
+          | _ => [line]
+      else
+        [line]
+    String.intercalate "\n" (lines'.map (·.toString))
 
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
@@ -585,21 +597,40 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
                 </span>
               ])
           | none, none => do
-            let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}  \
-                        {rel} {rhs_s} := by {proof_s}"
-              else s!"_ {rel} {rhs_s} := by {proof_s}"
             if sugg.proof?.isSome then
+              let new_line := if params.isFirst
+                then s!"{lhs_s}\n{spc}  \
+                          {rel} {rhs_s} := by {proof_s}"
+                else s!"_ {rel} {rhs_s} := by {proof_s}"
               pure (new_line, #[.text "(closes this goal)", <br />, info])
             else
-              pure (new_line, #[.text "(does nothing; shouldn't be here!)", <br />, info])
+              let new_line := if params.isFirst
+                then s!"{lhs_s}\n{spc}  \
+                          {rel} {rhs_s} := by {proof_s}"
+                else s!""
+              pure (new_line, #[
+                .text "(removes this step)",
+                <br />,
+                <span className="font-code">
+                  {<- expr_component lhs}
+                  {sep}{.text rel}{sep}
+                  {<- expr_component rhs}
+                </span>,
+                <br />,
+                info
+              ])
+        let replaceRange := if new_text.isEmpty then
+          .mk (.mk params.replaceRange.start.line 0)
+              (.mk params.replaceRange.end.line.succ 0)
+        else
+          params.replaceRange
         let new_text := wrap_new_step_str new_text spc
         let new_selection := match new_text.find? "?_" with
           | none => (new_text.rawEndPos.dec, new_text.rawEndPos.dec)
           | some p => (p.offset, p.offset.inc.inc)
         pure <li style={json% { marginBottom: "10px" }}>
           {.ofComponent MakeEditLink
-            (.ofReplaceRange doc.meta params.replaceRange new_text (some new_selection))
+            (.ofReplaceRange doc.meta replaceRange new_text (some new_selection))
             #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
                 {.text s!"[{sugg.hint}] "}
               </span>]}
@@ -692,13 +723,11 @@ def comp_calc : CompSpec := by
       := by define exec (Code.push n c) s := exec c (n :: s)
     _ = exec (comp (Exp.val n) c) s
       := by define comp (Exp.val n) c := Code.push n c
-      -- = exec (comp (Exp.val n) c) s
-      --   := by {}
   case add x y ih_x ih_y => calc
-    exec c (eval (x.add y) :: s)
+    exec c (eval (.add x y) :: s)
       = exec c ((eval x + eval y) :: s) := by rfl
     _ = exec (.add c) (eval y :: eval x :: s) := by {}
-    _ = exec (comp y (comp x c)) s := by {}
-    _ = exec (comp (x.add y) c) s := by define comp (.add x y) c := comp y (comp x c)
+    _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
+    _ = exec (comp (.add x y) c) s := by define comp (.add x y) c := comp x (comp y c.add)
 end Calculation
 end Tactic
