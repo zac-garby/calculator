@@ -207,6 +207,7 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     let fn <- Tactic.withMainContext <| desugar_clause_def
       f.getId clause_expr inp_ty
       con_arg_names rest_names to_term
+    dbg_trace f!"got fn: {<- ppExpr fn}"
     define_mv clause_name fn
     if !mod.isSome then
       Tactic.withMainContext do
@@ -324,7 +325,13 @@ open ProofWidgets
 open Jsx
 open SelectInsertParamsClass Lean.SubExpr
 
-def sep (s : String := "5px") : Html := <span style={json% { marginRight: $s }} />
+def sep (s : String := "8px") : Html := <span style={json% { marginRight: $s }} />
+
+def pretty_mvars (s : String) : String :=
+  match s.splitOn "?m." with
+  | [] => ""
+  | [s] => s
+  | s::ss => s ++ "[⋯]" ++ "[⋯]".toSlice.intercalate (ss.map fun s ↦ s.dropWhile Char.isDigit)
 
 structure CalcParams extends SelectInsertParams where
   isFirst : Bool
@@ -332,11 +339,15 @@ structure CalcParams extends SelectInsertParams where
   deriving SelectInsertParamsClass, RpcEncodable
 
 def expr_component (e : Expr) : MetaM Html := do
-  let e' <- WithRpcRef.mk (<- ExprWithCtx.save e)
-  return .ofComponent InteractiveExpr { expr := e' } #[]
+  if e.hasExprMVar then
+    let str := pretty_mvars (toString <| <- ppExpr e)
+    return <span className="font-code">{.text str}</span>
+  else
+    let e' <- WithRpcRef.mk (<- ExprWithCtx.save e)
+    return .ofComponent InteractiveExpr { expr := e' } #[]
 
 @[suggest]
-def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
+def suggest_apply_hyp : CalcSuggester := fun goal _params lhs _ => do
   let mv := goal.mvarId
   let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
   let mut suggestions : Array Suggestion := #[]
@@ -354,64 +365,51 @@ def suggest_apply_hyp : CalcSuggester := fun goal lhs _ => do
             <span className="font-code"> : </span>
             {<- expr_component d.type}
           </span>
-        newLhs? := r.eNew
-        proofStr? := some s!"rw [{d.userName}]"
+        new_lhs? := r.eNew
+        proof? := some s!"rw [{d.userName}]"
       }
     catch | _ => pure ()
   return suggestions
 
-@[suggest]
-def suggest_dsimp : CalcSuggester := fun _ lhs _ => do
-  let simp_ctx <- mkSimpContext
-  let (lhs', stats) <- Meta.dsimp lhs simp_ctx
+def simp_suggester
+  (hint : String) (tac : String) (kind : Tactic.SimpKind) (allow_defeq := false)
+  : CalcSuggester := fun _goal _params lhs _rhs => do
+  let simp_ctx <- mkSimpContext (hasStar := true) (kind := kind)
+  let (res, stats) <- Meta.simp lhs simp_ctx
+  let lhs' := res.expr
   if lhs == lhs' then
     return #[]
   else if <- isDefEq lhs lhs' then
+    if !allow_defeq then return #[]
     return #[{
-      hint := "Reduce"
-      newLhs? := lhs'
-      proofStr? := some "rfl"
-      info? := some (.text "by reflexivity")
+      hint := s!"Simply (rfl)"
+      new_lhs? := lhs'
+      proof? := some "rfl"
+      info? := some (.text "reflexivity")
     }]
   else
-    let thms <- stats.usedTheorems.toArray.mapM fun o =>
-      toString <$> ppExpr (mkConst o.key [])
-    let thms_s := String.join (thms.toList.intersperse ", ")
+    let md_ctx := MessageDataContext.mk (<- getEnv) (<- getMCtx) (<- getLCtx) {}
+    let thms <- stats.usedTheorems.toArray.mapM fun o => do
+      let md <- ppOrigin o
+      md.format md_ctx
+    let fmt := Format.joinSep thms.toList ", "
     return #[{
-      hint := "Simplify (definitional)"
-      newLhs? := lhs'
-      info? := some
-        <span>
-          {.text "using "}
-          <span className="font-code">{.text thms_s}</span>
-        </span>
-      proofStr? := some s!"dsimp only [{thms_s}]"
+      hint := hint
+      new_lhs? := lhs'
+      info? := some <span className="font-code">{.text fmt.pretty}</span>
+      proof? := some s!"{tac} only [{fmt}]"
     }]
 
 @[suggest]
-def suggest_simp : CalcSuggester := fun _ lhs _ => do
-  let simp_ctx <- mkSimpContext
-  let (res, stats) <- Meta.simp lhs simp_ctx
-  let lhs' := res.expr
-  if lhs == lhs' || (<- isDefEq lhs lhs') then
-    return #[]
-  else
-    let thms <- stats.usedTheorems.toArray.mapM fun o =>
-      toString <$> ppExpr (mkConst o.key [])
-    let thms_s := String.join (thms.toList.intersperse ", ")
-    return #[{
-      hint := "Simplify"
-      newLhs? := lhs'
-      info? := some
-        <span>
-          {.text "using "}
-          <span className="font-code">{.text thms_s}</span>
-        </span>
-      proofStr? := some s!"simp only [{thms_s}]"
-    }]
+def suggest_dsimp : CalcSuggester
+  := simp_suggester "Simplify (dsimp)" "dsimp" .dsimp (allow_defeq := true)
 
 @[suggest]
-def suggest_define : CalcSuggester := fun goal lhs rhs => do
+def suggest_simp : CalcSuggester
+  := simp_suggester "Simplify (simp)" "simp" .simp
+
+@[suggest]
+def suggest_define : CalcSuggester := fun goal _params lhs rhs => do
   let mv := goal.mvarId
   let lhs_stx <- PrettyPrinter.delab lhs
   let rhs_stx <- PrettyPrinter.delab rhs
@@ -424,31 +422,49 @@ def suggest_define : CalcSuggester := fun goal lhs rhs => do
   match mvs with
     | [] => return #[{
         hint := "Define"
-        proofStr? := some (toString proof)
+        proof? := some (toString proof)
         info? := <span className="font-code">
-          {<- expr_component rhs}<br />
-          {sep "8px"}{.text ":="}{sep "8px"}
+          {<- expr_component rhs}
+          {sep}{.text ":="}{sep}
           {<- expr_component lhs}
         </span>
       }]
     | _ => return #[]
 
 @[suggest]
-def suggest_cong : CalcSuggester := fun goal lhs rhs => do
+def suggest_cong : CalcSuggester := fun goal params lhs rhs => do
   let (lfn, largs) := lhs.getAppFnArgs
   let (rfn, rargs) := rhs.getAppFnArgs
   if lfn = rfn && largs.size = rargs.size then
-    try_cong goal lfn (Array.zip largs rargs).toList
+    try_cong goal params lfn (Array.zip largs rargs).toList
   else
     return #[]
   where
-    pairwise_eq := fun (l, r) => pure (l == r) -- withNewMCtxDepth (isDefEq l r)
-    try_cong (goal) (_fn : Name) (args : List (Expr × Expr)) : MetaM (Array Suggestion) := do
+    pairwise_eq := fun (l, r) => withNewMCtxDepth (isDefEq l r)
+    try_cong (goal params) (_fn : Name) (args : List (Expr × Expr)) : MetaM (Array Suggestion) := do
       let (_, (l, r) :: post) <- args.partitionM pairwise_eq
         | do return #[] -- in this case, all args already equal...
-      if !(<- post.allM pairwise_eq) then
-        return #[]
-      all_suggestions goal l r
+      if !(<- post.allM pairwise_eq) then return #[]
+      all_suggestions goal params l r
+
+@[suggest]
+def suggest_replace_subexpr : CalcSuggester := fun goal params _lhs _rhs => do
+  let subs := getGoalLocations params.selectedLocations
+  let sel_left := subs.any fun L => #[0, 1].isPrefixOf L.toArray
+  let sel_right := subs.any fun L => #[1].isPrefixOf L.toArray
+  let mut goal_ty <- goal.mvarId.getType''
+  for pos in subs do
+    goal_ty <- insertMetaVar goal_ty pos
+  let some (_, lhs', rhs') <- getCalcRelation? goal_ty
+    | throwError "invalid 'calc' step when replacing subexpressions, relation expected{indentD goal_ty}"
+  if !sel_left && !sel_right then
+    return #[]
+  return #[{
+    hint := "Rewrite"
+    new_lhs? := if sel_left then some lhs' else none
+    new_rhs? := if sel_right then some rhs' else none
+    info? := some (.text "some new goal")
+  }]
 
 def unpack_calc_goal (goal_ty : Expr)
   : MetaM (String × Expr × String × Expr × String) := do
@@ -462,6 +478,17 @@ def unpack_calc_goal (goal_ty : Expr)
   let rhs_s := (toString <| <- ppExpr rhs).renameMetaVar
   pure (rel_s, lhs, lhs_s, rhs, rhs_s)
 
+def wrap_new_step_str (str indent : String) : String :=
+  let lines := str.lines
+  let lines' := lines.toList.flatMap fun line =>
+    if line.positions.length > 95 then
+      match line |>.split ":=" |>.toList with
+        | (step::rest) => [step, indent ++ "  :=" ++ String.intercalate ":=" (rest.map (·.toString))]
+        | _ => [line]
+    else
+      [line]
+  String.intercalate "\n" (lines'.map (·.toString))
+
 @[server_rpc_method]
 def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
   fun params => RequestM.withWaitFindSnapAtPos params.pos fun _snap => do
@@ -471,9 +498,11 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
     | main_goal :: _ => main_goal.ctx.val.runMetaM {} <| main_goal.mvarId.withContext do
       let mv := main_goal.mvarId
       let mty <- mv.getType''
-      let (rel, lhs, lhs_s, rhs, rhs_s) <- unpack_calc_goal mty
+      let (rel, lhs, lhs_s, rhs, rhs_s) <- try
+        unpack_calc_goal mty
+      catch | _ => return <p>{.text "Place your cursor in a step's proof slot to use this"}</p>
       let spc := String.replicate params.indent ' '
-      let mut suggestions <- all_suggestions main_goal lhs rhs
+      let mut suggestions <- all_suggestions main_goal { params with } lhs rhs
       if suggestions.isEmpty then
         return <p>{.text "No suggestions"}</p>
       let ul_style := json%{
@@ -481,35 +510,100 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
         paddingLeft: "20px"
       }
       let ul <- Html.element "ul" #[("style", ul_style)] <$> suggestions.mapM fun sugg => do
-        let proof_s := sugg.proofStr?.getD "{}"
-        let (new_line, content) <- match sugg.newLhs? with
-          | some lhs' => do
-            let exp <- ExprWithCtx.save lhs' >>= (WithRpcRef.mk ·)
+        let proof_s := sugg.proof?.getD "{}"
+        let info := sugg.info? |>.map (fun i => <span>{.text "by "}{i}</span>)  |>.getD (.text "")
+        let (new_text, content) <- match sugg.new_lhs?, sugg.new_rhs? with
+          | some lhs', some rhs' => do
+            let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
+            let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
+            let new_line := if params.isFirst
+              then s!"{lhs_s}\n{spc}  \
+                        {rel} {lhs'_s} := by \{}\n{spc}\
+                      _ {rel} {rhs'_s} := by \{}\n{spc}\
+                      _ {rel} {rhs_s} := by \{}"
+              else s!"_ {rel} {lhs'_s} := by \{}\n{spc}\
+                      _ {rel} {rhs'_s} := by \{}\n{spc}\
+                      _ {rel} {rhs_s} := by \{}"
+            pure (new_line,
+              #[<br />,
+                <span className="font-code">
+                  {<- expr_component lhs}
+                  {sep}{.text rel}{sep}
+                  {<- expr_component rhs}
+                </span>,
+                <br />,
+                <span>{sep}{.text "===>"}{sep}{info}</span>,
+                <br />,
+                <span className="font-code">
+                  {<- expr_component lhs'}
+                  {sep}{.text rel}{sep}
+                  {<- expr_component rhs'}
+                </span>
+              ])
+          | some lhs', none => do
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let new_line := if params.isFirst
-              then s!"{lhs_s} {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+              then s!"{lhs_s}\n{spc}  \
+                      {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
               else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
             pure (new_line,
-              <span>
-                {.text "LHS"}{sep "8px"}{.text "↦"}{sep "8px"}
-                {Html.ofComponent InteractiveExpr { expr := exp } #[]}
-              </span>)
-          | none => do
+              #[<br />,
+                <span className="font-code">
+                  {<- expr_component lhs}
+                  {sep}{.text rel}{sep}
+                  {.text "···"}
+                </span>,
+                <br />,
+                <span>{sep}{.text "===>"}{sep}{info}</span>,
+                <br />,
+                <span className="font-code">
+                  {<- expr_component lhs'}
+                  {sep}{.text rel}{sep}
+                  {.text "···"}
+                </span>
+              ])
+          | none, some rhs' => do
+            let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
-              then s!"{lhs_s} {rel} {rhs_s} := by {proof_s}"
+              then s!"{lhs_s}\n{spc}  \
+                        {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+              else s!"_ {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+            pure (new_line,
+              #[<br />,
+                <span className="font-code">
+                  {.text "···"}
+                  {sep}{.text rel}{sep}
+                  {<- expr_component rhs}
+                </span>,
+                <br />,
+                <span>{sep}{.text "===>"}{sep}{info}</span>,
+                <br />,
+                <span className="font-code">
+                  {.text "···"}
+                  {sep}{.text rel}{sep}
+                  {<- expr_component rhs'}
+                </span>
+              ])
+          | none, none => do
+            let new_line := if params.isFirst
+              then s!"{lhs_s}\n{spc}  \
+                        {rel} {rhs_s} := by {proof_s}"
               else s!"_ {rel} {rhs_s} := by {proof_s}"
-            pure (new_line, .text "(closes this goal)")
-        let new_selection := some (new_line.rawEndPos.dec, new_line.rawEndPos.dec)
+            if sugg.proof?.isSome then
+              pure (new_line, #[.text "(closes this goal)", <br />, info])
+            else
+              pure (new_line, #[.text "(does nothing; shouldn't be here!)", <br />, info])
+        let new_text := wrap_new_step_str new_text spc
+        let new_selection := match new_text.find? "?_" with
+          | none => (new_text.rawEndPos.dec, new_text.rawEndPos.dec)
+          | some p => (p.offset, p.offset.inc.inc)
         pure <li style={json% { marginBottom: "10px" }}>
           {.ofComponent MakeEditLink
-            (.ofReplaceRange doc.meta params.replaceRange new_line new_selection)
+            (.ofReplaceRange doc.meta params.replaceRange new_text (some new_selection))
             #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
                 {.text s!"[{sugg.hint}] "}
               </span>]}
-          {content}
-          <infobox style={json% { display: "block", marginLeft: "8px", marginTop: "8px" }}>
-            {sugg.info?.getD (.text "")}
-          </infobox>
+          {... content}
         </li>
       pure <p>{.text s!"Suggested next steps:"}{ul}</p>
     return <details «open»={decide (params.goals.size > 0)}>
@@ -552,11 +646,11 @@ def correct {a} : RevSpec a := by
     define aux [] ys := ys
   case cons x xs ih =>
     calc rev (x :: xs) ++ ys
-     _ = rev xs ++ [x] ++ ys := by rfl
-     _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
-     _ = aux xs (x :: ys) := by rw [ih]
-     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
-    --  _ = aux (x :: xs) ys := by {}
+     _ = aux (x :: xs) ys := by {}
+    --  _ = rev xs ++ [x] ++ ys := by rfl
+    --  _ = rev xs ++ x :: ys := by simp only [append_assoc, cons_append, nil_append]
+    --  _ = aux xs (x :: ys) := by rw [ih]
+    --  _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
 inductive Exp : Type
   | val : Nat -> Exp
@@ -593,9 +687,18 @@ def comp_calc : CompSpec := by
   -- Case val n:
   case val n => calc
     exec c (eval (Exp.val n) :: s)
-      = exec c (n :: s) := by rfl
-    _ = exec (comp (Exp.val n) c) s := by {}
-    -- _ = exec (Code.push n c) s := by define exec (Code.push n c) s := exec c (n :: s)
-
+    _ = exec c (n :: s) := by rfl
+    _ = exec (Code.push n c) s
+      := by define exec (Code.push n c) s := exec c (n :: s)
+    _ = exec (comp (Exp.val n) c) s
+      := by define comp (Exp.val n) c := Code.push n c
+      -- = exec (comp (Exp.val n) c) s
+      --   := by {}
+  case add x y ih_x ih_y => calc
+    exec c (eval (x.add y) :: s)
+      = exec c ((eval x + eval y) :: s) := by rfl
+    _ = exec (.add c) (eval y :: eval x :: s) := by {}
+    _ = exec (comp y (comp x c)) s := by {}
+    _ = exec (comp (x.add y) c) s := by define comp (.add x y) c := comp y (comp x c)
 end Calculation
 end Tactic
