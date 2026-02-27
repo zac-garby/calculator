@@ -4,11 +4,11 @@ import Mathlib.Tactic.Common
 open Tactic.Calculation
 
 set_option linter.style.multiGoal false
+set_option linter.style.setOption false
+set_option pp.fieldNotation false
 
 structure Data where
   ctors : List (String × List Type)
-
-
 
 def rev {a} : List a → List a
   | [] => []
@@ -130,16 +130,22 @@ def comp_calc : CompSpec := by
       := by define exec (Code.push n c) s := exec c (n :: s)
     _ = exec (comp (Exp.val n) c) s
       := by define comp (Exp.val n) c := Code.push n c
-  case add x y ih_x ih_y => calc
-    exec c (eval (.add x y) :: s)
-      = exec c ((eval x + eval y) :: s) := by rfl
-    _ = exec (.add c) (eval y :: eval x :: s)
-      := by define exec (.add c') s := match s with
-            | m :: n :: s' => exec c' ((n + m) :: s')
-            | _ => don't care
-    _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
-    _ = exec (comp (.add x y) c) s
-      := by define comp (.add x y) c := comp x (comp y c.add)
+  case add x y ih_x ih_y =>
+    calc
+      exec c (eval (Exp.add x y) :: s)
+        = exec c ((eval x + eval y) :: s) := by rfl
+      _ = exec ?c' (eval y :: eval x :: s) := by {}
+      _ = exec (comp x (comp y ?c')) s := by simp only [ih_y, ih_x]
+      _ = exec (comp (Exp.add x y) c) s
+        := by define comp (Exp.add x y) c := comp x (comp y ?c')
+    --   = exec c ((eval x + eval y) :: s) := by rfl
+    -- _ = exec (.add c) (eval y :: eval x :: s)
+    --   := by define exec (.add c') s := match s with
+    --         | m :: n :: s' => exec c' ((n + m) :: s')
+    --         | _ => don't care
+    -- _ = exec (comp x (comp y c.add)) s := by simp only [ih_y, ih_x]
+    -- _ = exec (comp (Exp.add x y) c) s
+    --   := by define comp (Exp.add x y) c := comp x (comp y (Code.add c))
 
 #eval comp_calc.comp (.add (.val 1) (.val 2)) .halt
 #eval comp_calc.exec (comp_calc.comp (.add (.val 1) (.val 2)) .halt) []
