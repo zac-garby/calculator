@@ -39,11 +39,17 @@ set_option linter.style.setOption false
 set_option pp.fieldNotation false
 -- set_option linter.unusedVariables false
 
-macro "don't" "care" : term => `(panic! "found that we do actually care")
+macro "don't" "care" : term => `(panic! "found out the hard way that we do actually care")
 
 elab "[" " ? " (term)? "]" : tactic => return ()
 
 def no_proof := "[ ? ]"
+
+def is_inductive_ty (ty : Expr) : MetaM Bool := do
+  let ty <- whnf ty
+  match ty.getAppFn with
+  | .const name _ => return (<- getEnv).find? name |>.isSome
+  | _ => return false
 
 def of_inductive_ty (ty : Expr) : MetaM (Name × List (Name × Expr)) := do
   let ty <- whnf ty
@@ -176,31 +182,31 @@ def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit := do
     if (<- mv.getTag) == bind_name then do
       if <- mv.isAssigned then
         if !(<- isDefEq (.mvar mv) to_expr) then
-          throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n    (already assigned to {Expr.mvar mv})"
+          throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n    (already assigned to {<- ppExpr (.mvar mv)})"
       else
         mv.assignIfDefEq to_expr
 
-def define_clause (bind_name : Name) (args : TSyntaxArray `ident) (to_term : TSyntax `term) : Tactic.TacticM Unit := do
-  let body_node: TSyntax `term <- `(fun $args* => $to_term)
-  let mctx <- getMCtx
-  match mctx.findUserName? bind_name with
-  | none => throwUnknownNameWithSuggestions bind_name
-  | some mv => do
-    if (<- mv.getTag) == bind_name then do
-      let mv_ty <- mv.getType'
-      let to_expr <- elabTerm body_node (some mv_ty)
-      if <- mv.isAssigned then
-        if !(<- isDefEq (.mvar mv) to_expr) then
-          throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n  (already assigned to {Expr.mvar mv})"
-      else
-        mv.assignIfDefEq to_expr
+-- def define_clause (bind_name : Name) (args : TSyntaxArray `ident) (to_term : TSyntax `term) : Tactic.TacticM Unit := do
+--   let body_node: TSyntax `term <- `(fun $args* => $to_term)
+--   let mctx <- getMCtx
+--   match mctx.findUserName? bind_name with
+--   | none => throwUnknownNameWithSuggestions bind_name
+--   | some mv => do
+--     if (<- mv.getTag) == bind_name then do
+--       let mv_ty <- mv.getType'
+--       let to_expr <- elabTerm body_node (some mv_ty)
+--       if <- mv.isAssigned then
+--         if !(<- isDefEq (.mvar mv) to_expr) then
+--           throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n  (already assigned to {Expr.mvar mv})"
+--       else
+--         mv.assignIfDefEq to_expr
 
-elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " to_term:term : tactic
-  => do
-  define_clause v.getId args to_term
-  if !mod.isSome then
-    Tactic.withMainContext do
-      Tactic.evalTactic (<- `(tactic| try rfl))
+-- elab (name := defineTactic) "define!" mod:("only")? v:ident args:ident* " := " to_term:term : tactic
+--   => do
+--   define_clause v.getId args to_term
+--   if !mod.isSome then
+--     Tactic.withMainContext do
+--       Tactic.evalTactic (<- `(tactic| try rfl))
 
 def count_implicit_args (ty : Expr) : Nat := match ty with
   | .forallE _ _ b .implicit => 1 + count_implicit_args b
@@ -239,15 +245,22 @@ def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
     throwErrorAt stx "unexpected syntax in pattern: {stx'.getKind.toString}"
 
 elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
-  => match p with
+  => do
+  let main_goal <- Tactic.withMainContext Tactic.getMainGoal
+  let mctx <- Tactic.withMainContext getMCtx
+  match p with
+  | `($f:ident) => do
+    let (some mv) := mctx.findUserName? f.getId
+      | throwErrorAt f "the name {f.getId} is undefined"
+    let mv_ty <- mv.getType''
+    let to_expr <- elabTerm to_term (some mv_ty)
+    define_mv f.getId to_expr
   | `($f:ident $pat:term $rest*) => do
-    let main_goal <- Tactic.withMainContext Tactic.getMainGoal
-    let mctx <- Tactic.withMainContext getMCtx
     let (some search_fn_mv) := mctx.findUserName? f.getId
-      | throwErrorAt f "the name {f} is undefined in {mctx.decls.toList.map fun (_, b) => b.userName}"
+      | throwErrorAt f "the name {f.getId} is undefined"
     let search_ty <- search_fn_mv.getType''
     let some (inp_ty, _) := search_ty.arrow?
-      | throwErrorAt f "cannot define a clause in non-function {f}"
+      | throwErrorAt f "unexpected argument in definition of non-function {f}"
     -- expand out the constructor argument's pattern to figure out the name
     -- of the constructor and its (explicit) arguments
     let pat <- liftMacroM <| expandMacros pat
@@ -276,7 +289,6 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
         Tactic.evalTactic (<- `(tactic| try rfl))
   | _ => throwUnsupportedSyntax
 
-#allow_unused_tactic! defineTactic
 #allow_unused_tactic! defineTacticSugared
 
 def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
@@ -290,16 +302,12 @@ def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
   Tactic.replaceMainGoal [new_main]
   return fv
 
-def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name : Name := field_name)
-    : Tactic.TacticM (FVarId × List (Name × Expr))
-  := do
-  let (field_ty, inp_ty, mot_ty) <- match fields.find? (fun (n, _) => n = field_name) with
-    | none => throwUnknownNameWithSuggestions field_name (extraMsg := m!", could be any of {fields.map (·.fst)}")
-    | some (_, field) => do
-      let field_type <- inferType field >>= instantiateMVars
-      match field_type.arrow? with
-      | none => throwError m!"cannot calculate non-arrow-type {field_type} of '{field_name}'"
-      | some t => pure (field_type, t)
+def calc_intro_recursor (field_name as_name : Name) (field_ty : Expr)
+  : Tactic.TacticM Expr := do
+  let (inp_ty, mot_ty) <- do
+    match field_ty.arrow? with
+    | none => throwError m!"cannot calculate non-arrow-type {field_ty} of '{field_name}'"
+    | some t => pure t
   -- find the recursor
   let (_, ctors) <- of_inductive_ty inp_ty
   let (_, recursor, rec_ty) <- get_recursor inp_ty
@@ -336,7 +344,26 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
   -- add a 'let ... = ...' for this constructor to the main goal, and then intro it as a hypothesis
   let field_body := mkAppN recursor (ms ++ algebra_mv_exps)
   let fv <- intro_let_in_main_goal as_name final_ty field_body
-  return (fv, algebras.map fun (mv, n, _) => (n, mv))
+  return .fvar fv
+
+def calc_intro_other (_ as_name : Name) (field_ty : Expr)
+  : Tactic.TacticM Expr := do
+  let field_body <- mkFreshExprMVar (some field_ty)
+  field_body.mvarId!.setUserName as_name
+  let _ <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
+  Tactic.appendGoals [field_body.mvarId!]
+  return field_body
+
+def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name : Name := field_name)
+    : Tactic.TacticM Expr
+  := do
+  let some (_, field) := fields.find? fun (n, _) => n = field_name
+    | throwUnknownNameWithSuggestions field_name (extraMsg := m!", could be any of {fields.map (·.fst)}")
+  let field_ty <- inferType field >>= instantiateMVars
+  if field_ty.isArrow then
+    calc_intro_recursor field_name as_name field_ty
+  else
+    calc_intro_other field_name as_name field_ty
 
 declare_syntax_cat calc_name
 syntax ident : calc_name
@@ -350,27 +377,27 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   if vs.getElems.size == 0 then
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
-  let fvs <- vs.getElems.mapM fun s => do
+  let vals <- vs.getElems.mapM fun s => do
     match s with
     | `(calc_name| $v:ident) =>
       let field_name := v.getId
-      let (fv, algebras) <- calc_intro_for field_name spec_fields
-      return (field_name, field_name, fv, algebras)
+      let val <- calc_intro_for field_name spec_fields
+      return (field_name, field_name, val)
     | `(calc_name| $v:ident as $r:ident) =>
       let field_name := v.getId
       let as_name := r.getId
-      let (fv, algebras) <- calc_intro_for field_name spec_fields (as_name := as_name)
-      return (field_name, as_name, fv, algebras)
+      let val <- calc_intro_for field_name spec_fields (as_name := as_name)
+      return (field_name, as_name, val)
     | _ => throwUnsupportedSyntax
   -- split the main goal into its constructor fields, and set each one to the corresponding
   -- recursor binding from above
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
   Tactic.pushGoals field_mvs
-  for (field_name, as_name, fv, _) in fvs do
+  for (field_name, as_name, val) in vals do
     for field_mv in field_mvs do
       if (<- field_mv.getTag) == field_name then
-        field_mv.assign (.fvar fv)
+        field_mv.assign val
         field_mv.setUserName as_name
 
 open Server
@@ -379,6 +406,11 @@ open Jsx
 open SelectInsertParamsClass Lean.SubExpr
 
 def sep (s : String := "8px") : Html := <span style={json% { marginRight: $s }} />
+
+def withExtra (edits : Array Lsp.TextEdit)
+  (props : MakeEditLinkProps) : MakeEditLinkProps :=
+  { props with edit := { props.edit with edits
+    := (props.edit.edits.append edits) } }
 
 def pretty_mvars (s : String) : String :=
   match s.splitOn "?m." with
@@ -426,39 +458,12 @@ def suggest_apply_hyp : CalcSuggester := fun goal _doc _params lhs _ => do
     catch | _ => pure ()
   return suggestions
 
--- def simp_suggester
---   (hint : String) (tac : String) (kind : Tactic.SimpKind) (allow_defeq := false)
---   : CalcSuggester := fun doc _goal _params lhs _rhs => do
---   let simp_ctx <- mkSimpContext (hasStar := true) (kind := kind)
---   let (res, stats) <- Meta.simp lhs simp_ctx
---   let lhs' := res.expr
---   if lhs == lhs' then
---     return #[]
---   else if <- isDefEq lhs lhs' then
---     if !allow_defeq then return #[]
---     return #[{
---       hint := s!"Simply (rfl)"
---       new_lhs? := lhs'
---       proof? := some "rfl"
---       info? := some (.text "reflexivity")
---     }]
---   else
---     let md_ctx := MessageDataContext.mk (<- getEnv) (<- getMCtx) (<- getLCtx) {}
---     let thms <- stats.usedTheorems.toArray.mapM fun o => do
---       let md <- ppOrigin o
---       md.format md_ctx
---     let fmt := Format.joinSep thms.toList ", "
---     return #[{
---       hint := hint
---       new_lhs? := lhs'
---       info? := some <span className="font-code">{.text fmt.pretty}</span>
---       proof? := some s!"{tac} only [{fmt}]"
---     }]
+def simp_cfg : Simp.Config := { singlePass := true }
 
 @[suggest]
 def suggest_dsimp : CalcSuggester
   := fun _doc _goal _params lhs _rhs => do
-  let simp_ctx <- mkSimpContext (hasStar := true)
+  let simp_ctx <- mkSimpContext (hasStar := true) (cfg := simp_cfg)
   let (lhs', stats) <- Meta.dsimp lhs simp_ctx
   if lhs == lhs' then
     return #[]
@@ -498,8 +503,8 @@ def get_simp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format))
 @[suggest]
 def suggest_simp : CalcSuggester
   := fun _doc _goal _params lhs _rhs => do
-  let no_star <- get_simp (<- mkSimpContext (hasStar := false)) lhs
-  let with_star <- get_simp (<- mkSimpContext (hasStar := true)) lhs
+  let no_star <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
+  let with_star <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
   let lhss := no_star.toArray ++ with_star.toArray
   return lhss.map fun (lhs', fmt) => {
     hint := "Simplify: simp"
@@ -536,11 +541,17 @@ def get_selected_exprs {Params : Type} [SelectInsertParamsClass Params]
   let subs := getGoalLocations (selectedLocations params)
   subs.mapM fun pos => viewSubexpr (fun _ e => pure e) pos goal_ty
 
+private partial def find_substrings_aux {str} (s : String) acc (start : String.Pos str)
+  := match start.find? s with
+    | none => acc
+    | some p => (p.offset, p.offset.increaseBy s.length) :: find_substrings_aux s acc p.next!
+
+def find_substrings (s src : String) : List (String.Pos.Raw × String.Pos.Raw)
+  := find_substrings_aux s [] src.startPos
+
 @[suggest]
-def suggest_new_constructor : CalcSuggester := fun goal doc params lhs rhs => do
-  if lhs.hasExprMVar then
-    dbg_trace f!"lhs has expr mvars; not yet supported for inst meta"
-  else if rhs.hasExprMVar then
+def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => do
+  if rhs.hasExprMVar then
     let mvars := rhs.collectMVars {} |>.result
     for mv in mvars do
       let decl <- mv.getDecl
@@ -568,20 +579,29 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params lhs rhs => do
         if let some ranges <- findDeclarationRanges? ctor then
           return ind.max ranges.range.toLspRange.start.character
         return 0) 2
-      let con_name <- ppExpr (.mvar mv) <&> toString
+      let mv_name <- ppExpr (.mvar mv) <&> toString
+      let con_name := "add"
+      let ty_name <- ppExpr (.const ind.name []) <&> toString
       let insert_text := s!"{String.replicate indent ' '}| {con_name} : {<- ppExpr con_ty}\n"
       let select_range := match insert_text.find? con_name with
         | none => (insert_text.rawStartPos, insert_text.rawEndPos.prev insert_text)
         | some p => (p.offset, p.offset.increaseBy con_name.length)
-      let con_app := mkAppN (.const (.str .anonymous "new_ctor") [])
+      let con_app := mkAppN (.const (.str (.str .anonymous ty_name) con_name) [])
         (cargs.map fun (_, ex, _) => ex)
+      let src := doc.meta.text
+      let holes_to_replace := find_substrings mv_name src.source
+      let hole_fill <- ppExpr con_app
+      let hole_edits : List Lsp.TextEdit := holes_to_replace.map fun (s, e) =>
+        { range := .mk (src.leanPosToLspPos (src.toPosition s))
+                       (src.leanPosToLspPos (src.toPosition e)),
+          newText := s!"({hole_fill})" }
       return #[{
         hint := ""
         info? := <span>
           <span className="font-code">
-            define: new_ctor :
+            {.text s!"define: {con_name} : "}
             {<- expr_component con_ty},<br />
-            {.text s!"let {con_name} := "}
+            {.text s!"let {mv_name} := "}
             {<- expr_component con_app}
             <br />
           </span>
@@ -590,9 +610,10 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params lhs rhs => do
           </span>
         </span>
         custom_button? := Html.ofComponent MakeEditLink
-          (.ofReplaceRange doc.meta insert_range insert_text (some select_range))
+          (.ofReplaceRange doc.meta insert_range insert_text (some select_range)
+            |> withExtra hole_edits.toArray)
           #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
-            {.text s!"[New {<- ppExpr (.const ind.name [])} constructor]"}</span>]
+            {.text s!"[New {ty_name} constructor]"}</span>]
       }]
   return #[]
 
@@ -606,7 +627,7 @@ def suggest_cong : CalcSuggester := fun goal doc params lhs rhs => do
     return #[]
   where
     pairwise_eq := fun (l, r) => withNewMCtxDepth (isDefEq l r)
-    try_cong (goal doc params) (fn : Name) (args : List (Expr × Expr)) : MetaM (Array Suggestion) := do
+    try_cong (goal doc params) (_fn : Name) (args : List (Expr × Expr)) : MetaM (Array Suggestion) := do
       let (pre, (l, r) :: post) <- args.partitionM pairwise_eq
         | do return #[] -- in this case, all args already equal...
       if !(<- post.allM pairwise_eq) then return #[]
@@ -698,8 +719,8 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}  \
-                        {rel} {lhs'_s} := by {no_proof}\n{spc}\
+              then s!"{lhs_s}\n{spc}\
+                      _ {rel} {lhs'_s} := by {no_proof}\n{spc}\
                       _ {rel} {rhs'_s} := by {no_proof}\n{spc}\
                       _ {rel} {rhs_s} := by {no_proof}"
               else s!"_ {rel} {lhs'_s} := by {no_proof}\n{spc}\
@@ -724,8 +745,8 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
           | some lhs', none => do
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}  \
-                      {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
+              then s!"{lhs_s}\n{spc}\
+                      _ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
               else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,
               #[<br />,
@@ -746,8 +767,8 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
           | none, some rhs' => do
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}  \
-                        {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
+              then s!"{lhs_s}\n{spc}\
+                      _ {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
               else s!"_ {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,
               #[<br />,
@@ -768,14 +789,14 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
           | none, none => do
             if sugg.proof?.isSome then
               let new_line := if params.isFirst
-                then s!"{lhs_s}\n{spc}  \
-                          {rel} {rhs_s} := by {proof_s}"
+                then s!"{lhs_s}\n{spc}\
+                        _ {rel} {rhs_s} := by {proof_s}"
                 else s!"_ {rel} {rhs_s} := by {proof_s}"
               pure (new_line, #[.text "(closes this goal)", <br />, info])
             else if sugg.custom_button?.isSome then
               let new_line := if params.isFirst
-                then s!"{lhs_s}\n{spc}  \
-                          {rel} {rhs_s} := by {proof_s}"
+                then s!"{lhs_s}\n{spc}\
+                        _ {rel} {rhs_s} := by {proof_s}"
                 else s!"_ {rel} {rhs_s} := by {proof_s}"
               pure (new_line, #[info])
             else
@@ -858,10 +879,12 @@ def rev {a} : List a → List a
 
 structure RevSpec a : Type where
   aux : List a -> List a -> List a
+  foo : Nat
   correct : ∀ xs ys, rev xs ++ ys = aux xs ys
 
 def correct {a} : RevSpec a := by
-  calculate aux
+  calculate aux, foo as bar
+  define bar := 5
   intro xs
   induction xs <;> intro ys
   case nil =>
@@ -873,52 +896,57 @@ def correct {a} : RevSpec a := by
     _ = aux xs (x :: ys) := by simp only [ih]
     _ = aux (x :: xs) ys := by define aux (x :: xs) ys := aux xs (x :: ys)
 
-inductive Exp : Type
-  | val : Nat -> Exp
-  | add : Exp -> Exp -> Exp
-  deriving BEq
+-- inductive Exp : Type
+--   | val : Nat -> Exp
+--   | add : Exp -> Exp -> Exp
+--   deriving BEq
 
-compile_inductive% Exp
+-- compile_inductive% Exp
 
-@[simp]
-def eval : Exp -> Nat
-  | .val n => n
-  | .add x y => eval x + eval y
+-- @[simp]
+-- def eval : Exp -> Nat
+--   | .val n => n
+--   | .add x y => eval x + eval y
 
-inductive Code where
-  | push : Nat -> Code -> Code
-  | add : Code -> Code
-  | halt : Code
+-- inductive Code where
+--   | push : ℕ → Code → Code
+--   | add : Code → Code
+--   | halt : Code
 
-compile_inductive% Code
+-- compile_inductive% Code
 
-abbrev Stack := List Nat
+-- abbrev Stack := List Nat
 
-structure CompSpec where
-  comp : Exp -> Code -> Code
-  exec : Code -> Stack -> Stack
-  correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
+-- structure CompSpec where
+--   comp : Exp -> Code -> Code
+--   exec : Code -> Stack -> Stack
+--   correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
 
-def comp_calc : CompSpec := by
-  calculate comp, exec
-  intro e
-  induction e <;> intros c s
-  -- Define exec.halt
-  define exec (.halt s) := s
-  -- Case val n:
-  case val n => calc
-    exec c (eval (Exp.val n) :: s)
-    _ = exec c (n :: s) := by simp only [Tactic.Calculation.eval]
-    _ = exec ?c' (n :: s) := by [ ? ]
-    _ = exec (comp (Exp.val n) c) s := by [ ? ]
-  case add x y ih_x ih_y =>
-    calc
-      exec c (eval (Exp.add x y) :: s)
-        = exec c ((eval x + eval y) :: s) := by rfl
-      _ = exec (.add c) (eval y :: eval x :: s) := by {}
-      _ = exec (comp x (comp y (.add c))) s := by simp only [ih_y, ih_x]
-      _ = exec (comp (Exp.add x y) c) s
-        := by define comp (Exp.add x y) c := comp x (comp y (Code.add c))
+-- def comp_calc : CompSpec := by
+--   calculate comp, exec
+--   intro e
+--   induction e <;> intros c s
+--   -- Case val n:
+--   case val n => calc
+--     exec c (eval (Exp.val n) :: s)
+--     _ = exec c (n :: s) := by rfl
+--     _ = exec (Code.push n c) s
+--       := by define exec (Code.push n c) s := exec c (n :: s)
+--     _ = exec (comp (Exp.val n) c) s
+--       := by define comp (Exp.val n) c := (Code.push n c)
+--   case add x y ih_x ih_y => calc
+--     exec c (eval (Exp.add x y) :: s)
+--     _ = exec c ((eval x + eval y) :: s) := by rfl
+--     _ = exec (Code.add c) (eval x :: eval y :: s)
+--       := by define exec (.add c) s := match s with
+--           | (m::n::s) => exec c ((m + n) :: s)
+--           | _ => don't care
+--     _ = exec (comp x (Code.add c)) (eval y :: s) := by simp only [ih_x]
+--     _ = exec (comp y (comp x (Code.add c))) s := by simp only [ih_y]
+--     _ = exec (comp (Exp.add x y) c) s
+--       := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
+--   case halt =>
+--     exact id
 
 -- def comp_calc : CompSpec := by
 --   calculate comp, exec
@@ -938,10 +966,10 @@ def comp_calc : CompSpec := by
 --     calc
 --       exec c (eval (Exp.add x y) :: s)
 --         = exec c ((eval x + eval y) :: s) := by rfl
---       _ = exec ?c'' (eval y :: eval x :: s) := by {}
---       _ = exec (comp x (comp y ?c'')) s := by simp only [ih_y, ih_x]
+--       _ = exec Code.push' (eval y :: eval x :: s) := by {}
+--       _ = exec (comp x (comp y Code.push')) s := by simp only [ih_y, ih_x]
 --       _ = exec (comp (Exp.add x y) c) s
---         := by define comp (Exp.add x y) c := comp x (comp y ?c'')
+--         := by define comp (Exp.add x y) c := comp x (comp y Code.push')
 
 end Calculation
 end Tactic
