@@ -155,11 +155,10 @@ partial def get_id (stx : Syntax) : Option Name := match stx.getKind with
   | _ => none
 
 def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
-  let (stx', _) <- (CollectPatternVars.collect stx).run {}
-  if let some _ := get_id stx' then
-    return (stx', #[])
-  else if stx'.getKind == ``Lean.Parser.Term.app then
-    let (fn, #[], args, false) <- expandApp stx'
+  if let some _ := get_id stx then
+    return (stx, #[])
+  else if stx.getKind == ``Lean.Parser.Term.app then
+    let (fn, #[], args, false) <- expandApp stx
       | throwErrorAt stx "invalid constructor application here"
     let arg_names <- args.mapM fun
       | .stx s => match get_id s with
@@ -168,7 +167,7 @@ def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
       | _ => unreachable!
     return (fn, arg_names)
   else
-    throwErrorAt stx "unexpected syntax in pattern: {stx'.getKind.toString}"
+    throwErrorAt stx "unexpected syntax in pattern: {stx.getKind.toString}"
 
 elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
   => do
