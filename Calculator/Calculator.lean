@@ -41,6 +41,10 @@ set_option pp.fieldNotation false
 
 macro "don't" "care" : term => `(panic! "found that we do actually care")
 
+elab "[" " ? " (term)? "]" : tactic => return ()
+
+def no_proof := "[ ? ]"
+
 def of_inductive_ty (ty : Expr) : MetaM (Name × List (Name × Expr)) := do
   let ty <- whnf ty
   match ty.getAppFn with
@@ -219,7 +223,7 @@ partial def get_id (stx : Syntax) : Option Name := match stx.getKind with
   | _ => none
 
 def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
-  let (stx', _) ← (CollectPatternVars.collect stx).run {}
+  let (stx', _) <- (CollectPatternVars.collect stx).run {}
   if let some _ := get_id stx' then
     return (stx', #[])
   else if stx'.getKind == ``Lean.Parser.Term.app then
@@ -512,7 +516,6 @@ def suggest_define : CalcSuggester := fun goal _doc _params lhs rhs => do
   let tac <- `(tactic| define $rhs_stx := $lhs_stx)
   let save <- Meta.saveState
   let ctx <- getLCtx
-  dbg_trace f!"tactic = {<- ContextInfo.ppSyntax goal.ctx.val ctx tac}"
   let proof <- ContextInfo.ppSyntax goal.ctx.val ctx tac
   let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
   save.restore
@@ -573,8 +576,7 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params lhs rhs => do
       let con_app := mkAppN (.const (.str .anonymous "new_ctor") [])
         (cargs.map fun (_, ex, _) => ex)
       return #[{
-        hint := s!"Instantiate {decl.userName}"
-        new_lhs? := rhs
+        hint := ""
         info? := <span>
           <span className="font-code">
             define: new_ctor :
@@ -687,21 +689,22 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
         paddingLeft: "20px"
       }
       let ul <- Html.element "ul" #[("style", ul_style)] <$> suggestions.mapM fun sugg => do
-        let proof_s := sugg.proof?.getD "{}"
-        let info := sugg.info? |>.map (fun i => <span>{.text "by "}{i}</span>)  |>.getD (.text "")
-        let info := <div style={json% { display: "inline-block", verticalAlign: "top" }}>{info}</div>
+        let proof_s := sugg.proof?.getD no_proof
+        let info := <div style={json% { display: "inline-block", verticalAlign: "top" }}>
+          {sugg.info? |>.map (fun i => <span>{.text "by "}{i}</span>) |>.getD (.text "")}
+        </div>
         let (new_text, content) <- match sugg.new_lhs?, sugg.new_rhs? with
           | some lhs', some rhs' => do
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
               then s!"{lhs_s}\n{spc}  \
-                        {rel} {lhs'_s} := by \{}\n{spc}\
-                      _ {rel} {rhs'_s} := by \{}\n{spc}\
-                      _ {rel} {rhs_s} := by \{}"
-              else s!"_ {rel} {lhs'_s} := by \{}\n{spc}\
-                      _ {rel} {rhs'_s} := by \{}\n{spc}\
-                      _ {rel} {rhs_s} := by \{}"
+                        {rel} {lhs'_s} := by {no_proof}\n{spc}\
+                      _ {rel} {rhs'_s} := by {no_proof}\n{spc}\
+                      _ {rel} {rhs_s} := by {no_proof}"
+              else s!"_ {rel} {lhs'_s} := by {no_proof}\n{spc}\
+                      _ {rel} {rhs'_s} := by {no_proof}\n{spc}\
+                      _ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,
               #[<br />,
                 <span className="font-code">
@@ -722,8 +725,8 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let new_line := if params.isFirst
               then s!"{lhs_s}\n{spc}  \
-                      {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
-              else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+                      {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
+              else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,
               #[<br />,
                 <span className="font-code">
@@ -744,8 +747,8 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
               then s!"{lhs_s}\n{spc}  \
-                        {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
-              else s!"_ {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by \{}"
+                        {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
+              else s!"_ {rel} {rhs'_s} := by {proof_s}\n{spc}_ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,
               #[<br />,
                 <span className="font-code">
@@ -769,10 +772,15 @@ def rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
                           {rel} {rhs_s} := by {proof_s}"
                 else s!"_ {rel} {rhs_s} := by {proof_s}"
               pure (new_line, #[.text "(closes this goal)", <br />, info])
-            else
+            else if sugg.custom_button?.isSome then
               let new_line := if params.isFirst
                 then s!"{lhs_s}\n{spc}  \
                           {rel} {rhs_s} := by {proof_s}"
+                else s!"_ {rel} {rhs_s} := by {proof_s}"
+              pure (new_line, #[info])
+            else
+              let new_line := if params.isFirst
+                then rhs_s
                 else s!""
               pure (new_line, #[
                 .text "(removes this step)",
@@ -824,7 +832,7 @@ def panel : Component CalcParams :=
 elab_rules : tactic
 | `(tactic|calc%$calcstx $steps) => do
   let mut isFirst := true
-  for step in ← Lean.Elab.Term.mkCalcStepViews steps do
+  for step in <- Lean.Elab.Term.mkCalcStepViews steps do
     let some replaceRange := (<- getFileMap).lspRangeOfStx? step.ref | continue
     let json := json% {
       "isFirst": $(isFirst),
@@ -833,7 +841,15 @@ elab_rules : tactic
     }
     Widget.savePanelWidgetInfo panel.javascriptHash (pure json) step.proof
     isFirst := false
-  Tactic.evalCalc (← `(tactic|calc%$calcstx $steps))
+  Tactic.evalCalc (<- `(tactic|calc%$calcstx $steps))
+
+elab stx:"calc?" : tactic => Tactic.withMainContext do
+  let goalType <- whnfR (<- Tactic.getMainTarget)
+  unless (<- Lean.Elab.Term.getCalcRelation? goalType).isSome do
+    throwError "Cannot start a calculation here: the goal{indentExpr goalType}\nis not a relation."
+  let s <- `(tactic| calc $(<- Lean.PrettyPrinter.delab (<- Tactic.getMainTarget)) := by [ ? ])
+  Tactic.TryThis.addSuggestions stx #[.suggestion s] (header := "Create calc tactic:")
+  Tactic.evalTactic (<- `(tactic|sorry))
 
 @[simp]
 def rev {a} : List a → List a
@@ -851,8 +867,7 @@ def correct {a} : RevSpec a := by
   case nil =>
     define aux [] ys := ys
   case cons x xs ih => calc
-    rev (x :: xs) ++ ys
-      = rev xs ++ [x] ++ ys := by rfl
+    rev xs ++ [x] ++ ys
     _ = rev xs ++ x :: ys
       := by simp only [List.append_assoc, List.cons_append, List.nil_append]
     _ = aux xs (x :: ys) := by simp only [ih]
@@ -893,9 +908,9 @@ def comp_calc : CompSpec := by
   -- Case val n:
   case val n => calc
     exec c (eval (Exp.val n) :: s)
-    _ = exec c (n :: s) := by rfl
-    _ = exec ?c' s := by {}
-    _ = exec (comp (Exp.val n) c) s := by {}
+    _ = exec c (n :: s) := by simp only [Tactic.Calculation.eval]
+    _ = exec ?c' (n :: s) := by [ ? ]
+    _ = exec (comp (Exp.val n) c) s := by [ ? ]
   case add x y ih_x ih_y =>
     calc
       exec c (eval (Exp.add x y) :: s)
