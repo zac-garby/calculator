@@ -13,28 +13,27 @@ def rev {a} : List a → List a
   | x :: xs => rev xs ++ [x]
 
 structure RevSpec a : Type where
-  aux : List a -> List a -> List a
-  foo : Nat
-  correct : ∀ xs ys, rev xs ++ ys = aux xs ys
+  fastrev : List a -> List a -> List a
+  correct : ∀ xs ys, rev xs ++ ys = fastrev xs ys
 
 def correct {a} : RevSpec a := by
-  calculate aux, foo as bar
-  refine aux => apply List.rec
-  define bar := 5
+  calculate fastrev
+  refine fastrev => apply List.rec
   intro xs
   induction xs <;> intro ys
   case nil => calc
     rev [] ++ ys
     _ = ys := by rfl
-    _ = aux [] ys := by define aux [] ys := ys
+    _ = fastrev [] ys := by define fastrev [] ys := ys
   case cons x xs ih => calc
     rev (x :: xs) ++ ys
     _ = rev xs ++ [x] ++ ys := by rfl
-    _ = rev xs ++ ([x] ++ ys) := by simp only [List.append_assoc]
-    _ = aux xs ([x] ++ ys) := by rw [ih]
-    _ = aux xs (x :: ys) := by rfl
-    _ = aux (x :: xs) ys
-      := by define aux (x :: xs) ys := aux xs (x :: ys)
+    _ = rev xs ++ ([x] ++ ys)
+      := by simp only [List.append_assoc]
+    _ = fastrev xs ([x] ++ ys) := by rw [ih]
+    _ = fastrev xs (x :: ys) := by rfl
+    _ = fastrev (x :: xs) ys
+      := by define fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
 inductive Exp : Type
   | val : Nat -> Exp
