@@ -6,7 +6,7 @@ import Calculator.Tactics
 open Nat
 open Option
 open List
-open Lean Meta Elab Term Macro Command
+open Lean Meta Elab Term Macro Command Tactic
 
 namespace Tactic
 namespace Calculation
@@ -25,20 +25,69 @@ namespace Calculation
       can be solved by
     exec c ((m + n) :: s) = exec c.add (n :: m :: s)
 
-* calculating data-types!
-    probably have to be 'pseudo'-types, as data themselves
-
-* better errorrs for e.g. (ys is not defined as an argument)
+* better errors for e.g. (ys is not defined as an argument)
     define aux (x :: xs) s := aux xs (x :: ys)
+
+* Keep track of which "calculation step" was introduced (at meta level?) so that
+  we can produce a human-readable / typesetted proof string
+
+* Automatically close any reflexive relation, not just ==, in calc
+
+* Have a tactic / hint for calc mode which tries to apply suggestions, exploring the
+  space, until it succeeds (kinda like `grind` etc)
+
+* If we've partially refined the proof of a step by hand (i.e. written some tactics) but it's
+  not closed yet, the suggester still makes suggestions, but they are not applied properly.
+
+* We can reduce definitions on selected subterms, but we should be able to do the
+  opposite too!
 -/
 
 set_option linter.style.multiGoal false
 set_option linter.style.setOption false
+set_option linter.unusedVariables false
 set_option pp.fieldNotation false
 
 @[widget_module]
 def panel : ProofWidgets.Component CalcParams :=
   mk_rpc_widget% suggestion_rpc
+
+def getCalcRelation? (e : Expr) : MetaM (Option (Expr × Expr × Expr)) := do
+  if e.getAppNumArgs < 2 then
+    return none
+  else
+    return some (e.appFn!.appFn!, e.appFn!.appArg!, e.appArg!)
+
+def getCalcRelation : TacticM (Expr × Expr × Expr) := do
+  let goalType <- whnfR (<- Tactic.getMainTarget)
+  let rel <- getCalcRelation? goalType
+  match rel with
+  | some rel => return rel
+  | none => throwError "cannot calculate a non-relation goal:{indentD goalType}"
+
+private def getCloserSuffix : TacticM (Option (TacticM (TSyntax `tactic))) := do
+  let (rel, _, _) <- getCalcRelation
+  -- Eq is fine: simp closes `a = a` via isDefEq, no extra step needed
+  if rel.getAppFn.constName? == some `Eq then
+    return none
+  -- For any other relation, check if there's a Std.Refl instance
+  let instTy <- mkAppM ``Std.Refl #[rel]
+  if (<- synthInstance? instTy).isSome then
+    return some `(tactic| try rfl)
+  return none
+
+private def appendToProof (suffix : TacticM (TSyntax `tactic)) (step : Syntax)
+  : TacticM (TSyntax k) :=
+  withRef step do
+    let sf <- suffix
+    match step with
+    | `(calcStep| $tm := by $prf) =>
+      let proof <- withRef prf `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
+      .mk <$> `(calcStep| $tm := by $proof)
+    | `(calcFirstStep| $tm := by $prf) =>
+      let proof <- withRef prf `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
+      .mk <$> `(calcFirstStep| $tm := by $proof)
+    | _ => return .mk step
 
 elab_rules : tactic
 | `(tactic|calc%$calcstx $steps) => do
@@ -52,13 +101,26 @@ elab_rules : tactic
     }
     Widget.savePanelWidgetInfo panel.javascriptHash (pure json) step.proof
     isFirst := false
+  let suffix <- getCloserSuffix
+  let steps <- if let some suffix := suffix then
+    match steps with
+    | `(calcSteps|
+        $step0:calcFirstStep
+        $rest*) => do
+      let step0' <- appendToProof suffix step0
+      let rest' <- rest.mapM (appendToProof suffix)
+      `(calcSteps|
+        $step0'
+        $rest'*)
+    | _ => do
+      logWarningAt steps "tried to add suffix to steps, but couldn't match syntax. bug?"
+      pure steps
+    else pure steps
   Tactic.evalCalc (<- `(tactic|calc%$calcstx $steps))
 
 elab stx:"calc?" : tactic => Tactic.withMainContext do
-  let goalType <- whnfR (<- Tactic.getMainTarget)
-  unless (<- Lean.Elab.Term.getCalcRelation? goalType).isSome do
-    throwError "Cannot start a calculation: the goal{indentExpr goalType}\nis not a relation."
-  let s <- `(tactic| calc $(<- Lean.PrettyPrinter.delab (<- Tactic.getMainTarget)) := by [ ? ])
+  discard <| getCalcRelation
+  let s <- `(tactic| calc $(<- Lean.PrettyPrinter.delab (<- Tactic.getMainTarget)) := by todo)
   Tactic.TryThis.addSuggestions stx #[.suggestion s] (header := "Create calc tactic:")
   Tactic.evalTactic (<- `(tactic|sorry))
 

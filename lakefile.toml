@@ -5,6 +5,9 @@ defaultTargets = ["Calculator"]
 
 [leanOptions]
 pp.unicode.fun = true # pretty-prints `fun a ↦ b`
+pp.fieldNotation = false
+linter.style.multiGoal = false
+linter.style.setOption = false
 relaxedAutoImplicit = false
 weak.linter.mathlibStandardSet = true
 maxSynthPendingDepth = 3

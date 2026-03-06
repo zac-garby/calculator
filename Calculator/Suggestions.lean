@@ -111,16 +111,29 @@ def get_simp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format))
 
 @[suggest]
 def suggest_simp : CalcSuggester
-  := fun _doc _goal _params lhs _rhs => do
+  := fun _doc _goal _params lhs rhs => do
   let no_star <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
   let with_star <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
   let lhss := no_star.toArray ++ with_star.toArray
   return lhss.map fun (lhs', fmt) => {
     hint := "Simplify: simp"
     new_lhs? := lhs'
-    info? := some <span className="font-code">{.text fmt.pretty}</span>
-    proof? := some s!"simp only [{fmt}]"
+    info? := <span className="font-code">{.text fmt.pretty}</span>
+    proof? := s!"simp only [{fmt}]"
   }
+
+@[suggest]
+def suggest_trivial : CalcSuggester := fun goal _doc _params _lhs _rhs => do
+  let mv := goal.mvarId
+  let save <- Meta.saveState
+  let (mvs, _) <- runTactic mv (<- `(tactic| try trivial))
+  save.restore
+  match mvs with
+    | [] => return #[{
+      hint := "Trivial"
+      proof? := "trivial"
+    }]
+    | _ => return #[]
 
 @[suggest]
 def suggest_define : CalcSuggester := fun goal _doc _params lhs rhs => do
@@ -189,7 +202,7 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => d
           return ind.max ranges.range.toLspRange.start.character
         return 0) 2
       let mv_name <- ppExpr (.mvar mv) <&> toString
-      let con_name := "add"
+      let con_name := "ctor"
       let ty_name <- ppExpr (.const ind.name []) <&> toString
       let insert_text := s!"{String.replicate indent ' '}| {con_name} : {<- ppExpr con_ty}\n"
       let select_range := match insert_text.find? con_name with
@@ -253,17 +266,20 @@ def suggest_cong : CalcSuggester := fun goal doc params lhs rhs => do
               </span>
             </span> }
 
-@[suggest]
-def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs => do
-  let subs := getGoalLocations params.selectedLocations
+private def get_selections (locs : Array GoalsLocation) : (Array Pos × Bool × Bool) :=
+  let subs := getGoalLocations locs
   let sel_left := subs.any fun L => #[0, 1].isPrefixOf L.toArray
   let sel_right := subs.any fun L => #[1].isPrefixOf L.toArray
-  let mut goal_ty <- goal.mvarId.getType''
+  (subs, sel_left, sel_right)
+
+@[suggest]
+def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs => do
+  let (subs, sel_left, sel_right) := get_selections params.selectedLocations
+  let mut goal_ty <- goal.mvarId.getType
   for pos in subs do
     goal_ty <- insertMetaVar goal_ty pos
   let some (_, lhs', rhs') <- getCalcRelation? goal_ty
-    | throwError "invalid 'calc' step when replacing subexpressions,\
-    relation expected{indentD goal_ty}"
+    | return #[]
   if !sel_left && !sel_right then
     return #[]
   return #[{
@@ -271,6 +287,26 @@ def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs =>
     new_lhs? := if sel_left then some lhs' else none
     new_rhs? := if sel_right then some rhs' else none
     info? := some (.text "some further proof / definition")
+  }]
+
+@[suggest]
+def suggest_expand_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
+  let (subs, sel_left, sel_right) := get_selections params.selectedLocations
+  let mut goal_ty <- goal.mvarId.getType
+  for pos in subs do
+    goal_ty <- replaceSubexpr whnf pos goal_ty
+  let some (_, lhs', rhs') <- getCalcRelation? goal_ty
+    | return #[]
+  let done_left := sel_left && lhs != lhs'
+  let done_right := sel_right && rhs != rhs'
+  if !done_left && !done_right then
+    return #[]
+  return #[{
+    hint := "Expand terms"
+    new_lhs? := if done_left then some lhs' else none
+    new_rhs? := if done_right then some rhs' else none
+    info? := <span className="font-code">rfl</span>
+    proof? := "rfl"
   }]
 
 def unpack_calc_goal (goal_ty : Expr)
@@ -301,6 +337,14 @@ def wrap_new_step_str (str indent : String) : String :=
         [line]
     String.intercalate "\n" (lines'.map (·.toString))
 
+private def new_selection (str : String) : (String.Pos.Raw × String.Pos.Raw) :=
+  if let some p := str.find? "?_" then
+    (p.offset, p.offset.increaseBy "?_".length)
+  else if let some p := str.find? no_proof then
+    (p.offset, p.offset.increaseBy no_proof.length)
+  else
+    (str.rawEndPos.dec, str.rawEndPos.dec)
+
 @[server_rpc_method]
 def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
   fun params => RequestM.withWaitFindSnapAtPos params.pos fun _snap => do
@@ -326,7 +370,10 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
         let info := <div style={json% { display: "inline-block", verticalAlign: "top" }}>
           {sugg.info? |>.map (fun i => <span>{.text "by "}{i}</span>) |>.getD (.text "")}
         </div>
-        let (new_text, content) <- match sugg.new_lhs?, sugg.new_rhs? with
+        let mut (new_lhs, new_rhs) := (sugg.new_lhs?, sugg.new_rhs?)
+        if new_lhs == rhs then
+          new_lhs := none
+        let (new_text, content) <- match new_lhs, new_rhs with
           | some lhs', some rhs' => do
             let lhs'_s := (toString <| <- ppExpr lhs').renameMetaVar
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
@@ -432,11 +479,9 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
         else
           params.replaceRange
         let new_text := wrap_new_step_str new_text spc
-        let new_selection := match new_text.find? "?_" with
-          | none => (new_text.rawEndPos.dec, new_text.rawEndPos.dec)
-          | some p => (p.offset, p.offset.inc.inc)
+        let new_sel := new_selection new_text
         let btn := sugg.custom_button?.getD (.ofComponent MakeEditLink
-            (.ofReplaceRange doc.meta replaceRange new_text (some new_selection))
+            (.ofReplaceRange doc.meta replaceRange new_text (some new_sel))
             #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
                 {.text s!"[{sugg.hint}] "}
               </span>])

@@ -3,10 +3,6 @@ import Mathlib.Tactic.Common
 
 open Tactic.Calculation
 
-set_option linter.style.multiGoal false
-set_option linter.style.setOption false
-set_option pp.fieldNotation false
-
 @[simp]
 def rev {a} : List a → List a
   | [] => []
@@ -88,3 +84,16 @@ def comp_calc : CompSpec := by
       := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
   case halt =>
     exact id
+
+section Improvement
+
+open Lean Elab
+
+elab "✓" t:term : term => do
+  let e <- Term.elabTerm t none
+  dbg_trace f!"e = {e}"
+  return e.mdata { entries := [(`check, true)] }
+
+#reduce fun m => 1 + ✓ (m + 1)
+
+end Improvement

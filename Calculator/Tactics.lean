@@ -9,12 +9,13 @@ set_option linter.style.setOption false
 set_option pp.fieldNotation false
 
 open Option List
-open Lean Meta Elab Term Macro Command
+open Lean Meta Elab Term Macro Command Mathlib.Tactic Qq
 
 macro "don't" "care" : term => `(panic! "found out the hard way that we do actually care")
 
-elab "[" " ? " (term)? "]" : tactic => return ()
-def no_proof := "[ ? ]"
+elab "todo" : tactic => return ()
+elab "todo" "[" term "]" : tactic => return ()
+def no_proof := "todo"
 
 def match_struct_fields (goal_type : Expr)
   : MetaM (Array Expr × Array (Name × Expr)) := do
@@ -295,5 +296,96 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
       if (<- field_mv.getTag) == field_name then
         field_mv.assign val
         field_mv.setUserName as_name
+
+macro "exists_mono" : tactic =>
+  `(tactic| (repeat' apply Exists.imp; intro))
+
+private partial def splitHyp (fv : FVarId) : Tactic.TacticM Unit :=
+  Tactic.withMainContext do
+    let goal <- Tactic.getMainGoal
+    let checkpoint <- Meta.saveState
+    try
+      let subgoals <- goal.cases fv
+      if let #[sg] := subgoals then
+        Tactic.replaceMainGoal [sg.mvarId]
+        for fieldExpr in sg.fields do
+          if let some fieldFV := fieldExpr.fvarId? then
+            splitHyp fieldFV
+      else
+        checkpoint.restore
+    catch | _ => checkpoint.restore
+
+elab "unpkg" "[" fv:ident "]" : tactic => Tactic.withMainContext do
+  let fvar <- getFVarFromUserName fv.getId
+  splitHyp fvar.fvarId!
+
+elab "unpkg" : tactic => Tactic.withMainContext do
+  let un <- mkFreshUserName (.mkSimple "it")
+  let mv <- Tactic.getMainGoal
+  let (fv, mv') <- mv.intro un
+  Tactic.replaceMainGoal [mv']
+  splitHyp fv
+
+local infixl: 50 " <;> " => Tactic.andThenOnSubgoals
+
+open Tactic
+
+def restructureCore (tacs : TSyntaxArray `tactic) : TacticM Unit := do
+  _ <- tryTactic (evalTactic (<- `(tactic| contradiction)))
+  _ <- tryTactic (evalTactic (<- `(tactic| assumption)))
+  iterateUntilFailure do
+    let gs <- getUnsolvedGoals
+    allGoals <|
+      liftMetaTactic (fun m => do pure [(<- m.intros!).2]) <;>
+      Tauto.distribNot <;>
+      liftMetaTactic (MVarId.casesMatching casesMatch
+        (recursive := true) (throwOnNoMatch := false)) <;>
+      (do _ <- tryTactic (evalTactic (<- `(tactic| contradiction)))) <;>
+      liftMetaTactic (fun m => do pure [(<- m.intros!).2]) <;>
+      liftMetaTactic (constructorMatching · ctorMatch
+        (recursive := true) (throwOnNoMatch := false)) <;>
+      do _ <- tryTactic (evalTactic (<- `(tactic| assumption)))
+    allGoals <| for tac in tacs do
+      _ <- tryTactic (evalTactic tac)
+    let gs' <- getUnsolvedGoals
+    if gs == gs' then failure
+    pure ()
+  where
+    casesMatch (e : Q(Prop)) : MetaM Bool := match e with
+    | ~q(_ ∧ _) => pure true
+    | ~q(_ ∨ _) => pure true
+    | ~q(Exists _) => pure true
+    | ~q(False) => pure true
+    | _ => pure false
+    ctorMatch (e : Q(Prop)) : MetaM Bool := match e with
+    | ~q(_ ∧ _) => pure true
+    | ~q(_ ↔ _) => pure true
+    | ~q(True) => pure true
+    | _ => pure false
+
+def restructure (tacs : TSyntaxArray `tactic) : TacticM Unit := focus do
+  _ <- tryTactic (evalTactic (<- `(tactic| unpkg)))
+  restructureCore tacs
+  allGoals <| iterateUntilFailure do
+    let gs <- getUnsolvedGoals
+    for tac in tacs do
+      _ <- tryTactic (evalTactic tac)
+    _ <- tryTactic
+      <|  evalTactic (<- `(tactic| rfl))
+      <|> evalTactic (<- `(tactic| solve_by_elim))
+      <|> liftMetaTactic (constructorMatching · ctorMatch)
+    let gs' <- getUnsolvedGoals
+    if gs == gs' then failure
+    pure ()
+  where
+    ctorMatch (e : Q(Prop)) : MetaM Bool := match e with
+    | ~q(_ ∧ _) => pure true
+    | ~q(_ ↔ _) => pure true
+    | ~q(Exists _) => pure true
+    | ~q(True) => pure true
+    | _ => pure false
+
+elab "restructuring" "[" tacs:tactic* "]" : tactic => restructure tacs
+elab "restructuring" : tactic => restructure #[]
 
 end Tactic.Calculation
