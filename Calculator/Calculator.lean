@@ -52,8 +52,11 @@ set_option pp.fieldNotation false
 def panel : ProofWidgets.Component CalcParams :=
   mk_rpc_widget% suggestion_rpc
 
-def getCalcRelation? (e : Expr) : MetaM (Option (Expr × Expr × Expr)) := do
-  if e.getAppNumArgs < 2 then
+def getCalcRelation? (e : Expr) : TacticM (Option (Expr × Expr × Expr)) := do
+  if let some (a, b) := e.arrow? then
+    let rel <- Term.elabTerm (<- `(· -> ·)) none
+    return (rel, a, b)
+  else if e.getAppNumArgs < 2 then
     return none
   else
     return some (e.appFn!.appFn!, e.appFn!.appArg!, e.appArg!)
@@ -81,12 +84,9 @@ private def appendToProof (suffix : TacticM (TSyntax `tactic)) (step : Syntax)
   withRef step do
     let sf <- suffix
     match step with
-    | `(calcStep| $tm := by $prf) =>
+    | `(calcStep| $tm := by $prf) | `(calcFirstStep| $tm := by $prf) =>
       let proof <- withRef prf `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
       .mk <$> `(calcStep| $tm := by $proof)
-    | `(calcFirstStep| $tm := by $prf) =>
-      let proof <- withRef prf `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
-      .mk <$> `(calcFirstStep| $tm := by $proof)
     | _ => return .mk step
 
 elab_rules : tactic
@@ -113,10 +113,10 @@ elab_rules : tactic
         $step0'
         $rest'*)
     | _ => do
-      logWarningAt steps "tried to add suffix to steps, but couldn't match syntax. bug?"
+      logWarningAt steps "tried to add suffix to steps, but couldn't match. bug?"
       pure steps
     else pure steps
-  Tactic.evalCalc (<- `(tactic|calc%$calcstx $steps))
+  evalCalc (<- `(tactic|calc%$calcstx $steps))
 
 elab stx:"calc?" : tactic => Tactic.withMainContext do
   discard <| getCalcRelation

@@ -1,4 +1,5 @@
 import Calculator.Calculator
+import Calculator.Implication
 import Mathlib.Tactic.Common
 import Mathlib.Tactic.Order
 
@@ -82,28 +83,9 @@ class Sound (rel : TyRel) where
 
 end Types
 
-section Implication
-
-def imp (a b : Prop) : Prop := a -> b
-def impR (a b : Prop) : Prop := b -> a
-
-infix:25 " ==> " => imp
-infix:25 " <== " => impR
-
-@[simp, refl] theorem rfl_impR (a) : a <== a := by
-  unfold impR
-  exact id
-
-instance : IsTrans Prop impR where trans _ _ _ p q := p ∘ q
-instance : Std.Refl impR where refl := rfl_impR
-instance : IsPreorder Prop impR where
-
-end Implication
-
 section Calculations
 
--- @[delab app.Calculator.Example.Rel.Tm.ofVal]
--- def delabFoo : Delab := withAppArg delab
+open Calculator.Syntax.Implication
 
 def semTy : TyRel := fun e t => ∃ v, e ⇓ v ∧ v ∈ t
 scoped notation:50 "⊨ " e:50 " : " t:50 => semTy e t
@@ -115,59 +97,59 @@ variable
 
 def semTy.val : Σ' (p : Prop), p -> ⊨ v : t := by
   calculate fst as premise
-  change _ <== _
+  change _ <- _
   calc
     ⊨ v : t
-    _ <== ∃ v', v ⇓ v' ∧ v' ∈ t
+    _ <- ∃ v', v ⇓ v' ∧ v' ∈ t
       := by rfl
-    _ <== ∃ v', v = v' ∧ v' ∈ t
+    _ <- ∃ v', v = v' ∧ v' ∈ t
       := by restructuring
-    _ <== v ∈ t
+    _ <- v ∈ t
       := by restructuring
 
 def semTy.add : Σ' (p : Prop), p -> ⊨ e + e' : t := by
   calculate fst as premise
-  change _ <== _
+  change _ <- _
   calc
     ⊨ e + e' : t
-    _ <== ∃ v, e + e' ⇓ v ∧ v ∈ t
+    _ <- ∃ v, e + e' ⇓ v ∧ v ∈ t
       := by rfl
-    _ <== ∃ (v : Val) (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
+    _ <- ∃ (v : Val) (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
       := by restructuring
-    _ <== ∃ (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
+    _ <- ∃ (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
       := by restructuring
-    _ <== ∃ (n n' : ℤ), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
+    _ <- ∃ (n n' : ℤ), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
       := by restructuring
-    _ <== (∃ (n : ℤ), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : ℤ), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
+    _ <- (∃ (n : ℤ), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : ℤ), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
       := by restructuring
-    _ <== ⊨ e : .Int ∧ ⊨ e' : .Int ∧ t = .Int
+    _ <- ⊨ e : .Int ∧ ⊨ e' : .Int ∧ t = .Int
       := by restructuring
 
 def semTy.if_t : Σ' (p : Prop), p -> ⊨ if_ e then e₁ else e₂ : t := by
   calculate fst as premise
-  change _ <== _
+  change _ <- _
   calc
     ⊨ if_ e then e₁ else e₂ : t
-    _ <== ∃ v, (if_ e then e₁ else e₂) ⇓ v ∧ v ∈ t
+    _ <- ∃ v, (if_ e then e₁ else e₂) ⇓ v ∧ v ∈ t
       := by rfl
-    _ <== ∃ v, e ⇓ true ∧ e₁ ⇓ v ∧ v ∈ t
+    _ <- ∃ v, e ⇓ true ∧ e₁ ⇓ v ∧ v ∈ t
       := by restructuring [apply Eval.if_t]
-    _ <== e ⇓ true ∧ ∃ v, e₁ ⇓ v ∧ v ∈ t
+    _ <- e ⇓ true ∧ ∃ v, e₁ ⇓ v ∧ v ∈ t
       := by simp only [exists_and_left]
-    _ <== e ⇓ true ∧ ⊨ e₁ : t := by trivial
+    _ <- e ⇓ true ∧ ⊨ e₁ : t := by trivial
 
 def semTy.if_f : Σ' (p : Prop), p -> ⊨ if_ e then e₁ else e₂ : t := by
   calculate fst as premise
-  change _ <== _
+  change _ <- _
   calc
     ⊨ if_ e then e₁ else e₂ : t
-    _ <== ∃ v, (if_ e then e₁ else e₂) ⇓ v ∧ v ∈ t
+    _ <- ∃ v, (if_ e then e₁ else e₂) ⇓ v ∧ v ∈ t
       := by rfl
-    _ <== ∃ v, e ⇓ false ∧ e₂ ⇓ v ∧ v ∈ t
+    _ <- ∃ v, e ⇓ false ∧ e₂ ⇓ v ∧ v ∈ t
       := by restructuring [apply Eval.if_f]
-    _ <== e ⇓ false ∧ ∃ v, e₂ ⇓ v ∧ v ∈ t
+    _ <- e ⇓ false ∧ ∃ v, e₂ ⇓ v ∧ v ∈ t
       := by simp only [exists_and_left]
-    _ <== e ⇓ false ∧ ⊨ e₂ : t := by trivial
+    _ <- e ⇓ false ∧ ⊨ e₂ : t := by trivial
 
 #reduce semTy.val
 #reduce semTy.add
