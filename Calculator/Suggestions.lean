@@ -3,6 +3,7 @@ import Mathlib.Util.CompileInductive
 import Calculator.SuggesterExt
 import Calculator.Tactics
 import ProofWidgets.Data.Html
+import Lean.Server.InfoUtils
 
 
 namespace Tactic.Calculation
@@ -112,15 +113,23 @@ def get_simp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format))
 @[suggest]
 def suggest_simp : CalcSuggester
   := fun _doc _goal _params lhs rhs => do
-  let no_star <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
-  let with_star <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
-  let lhss := no_star.toArray ++ with_star.toArray
-  return lhss.map fun (lhs', fmt) => {
-    hint := "Simplify: simp"
+  let no_star_lhs <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
+  let with_star_lhs <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
+  let lhss := (no_star_lhs.toArray ++ with_star_lhs.toArray).map fun (lhs', fmt) => {
+    hint := "Simplify LHS: simp"
     new_lhs? := lhs'
     info? := <span className="font-code">{.text fmt.pretty}</span>
     proof? := s!"simp only [{fmt}]"
   }
+  let no_star_rhs <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) rhs
+  let with_star_rhs <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) rhs
+  let rhss := (no_star_rhs.toArray ++ with_star_rhs.toArray).map fun (rhs', fmt) => {
+    hint := "Simplify RHS: simp"
+    new_rhs? := rhs'
+    info? := <span className="font-code">{.text fmt.pretty}</span>
+    proof? := s!"simp only [{fmt}]"
+  }
+  return lhss ++ rhss
 
 @[suggest]
 def suggest_trivial : CalcSuggester := fun goal _doc _params _lhs _rhs => do
@@ -309,13 +318,74 @@ def suggest_expand_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
     proof? := "rfl"
   }]
 
+-- Try to fold `sub` into `name ?args` by unifying via isDefEq.
+-- Returns the instantiated application if all args are determined.
+private def tryFoldWith (name : Name) (sub : Expr) : MetaM (Option Expr) := do
+  let some ci := (← getEnv).find? name | return none
+  unless ci.hasValue do return none
+  let save ← Meta.saveState
+  try
+    let levels ← ci.levelParams.mapM fun _ => mkFreshLevelMVar
+    let e := Lean.mkConst name levels
+    let ty := ci.type.instantiateLevelParams ci.levelParams levels
+    let (args, _, _) ← forallMetaTelescopeReducing ty
+    let app := mkAppN e args
+    if ← isDefEq app sub then
+      let app' ← instantiateMVars app
+      save.restore
+      if !app'.hasMVar then return some app'
+    save.restore
+  catch _ => save.restore
+  return none
+
+-- Opposite of suggest_expand_subexpr: for each selected subterm, look for a
+-- definition in the current file whose unfolding is definitionally equal to it,
+-- and suggest replacing the subterm with that definition applied to arguments.
+-- E.g. turns (∃ n : ℤ, e ⇓ ↑n ∧ ↑n ∈ Ty.Int) into ⊨ e : .Int
+@[suggest]
+def suggest_fold_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
+  let (subs, sel_left, sel_right) := get_selections params.selectedLocations
+  if !sel_left && !sel_right then return #[]
+  let env ← getEnv
+  let candidates : List Name := env.constants.map₂.toList.filterMap fun (name, ci) =>
+    if ci.hasValue && !name.isAnonymous then some name else none
+  if candidates.isEmpty then return #[]
+  let mut suggestions : Array Suggestion := #[]
+  for candName in candidates do
+    let mut goal_ty ← goal.mvarId.getType
+    let mut anyFolded := false
+    for pos in subs do
+      let sub ← viewSubexpr (fun _ e => pure e) pos goal_ty
+      if let some folded ← tryFoldWith candName sub then
+        goal_ty ← replaceSubexpr (fun _ => pure folded) pos goal_ty
+        anyFolded := true
+    unless anyFolded do continue
+    let some (_, lhs', rhs') ← getCalcRelation? goal_ty | continue
+    let done_left := sel_left && lhs != lhs'
+    let done_right := sel_right && rhs != rhs'
+    unless done_left || done_right do continue
+    let name_s := toString (← ppExpr (← mkConstWithFreshMVarLevels candName))
+    suggestions := suggestions.push {
+      hint := "Fold"
+      new_lhs? := if done_left then some lhs' else none
+      new_rhs? := if done_right then some rhs' else none
+      info? := some <span className="font-code">{.text name_s}</span>
+      proof? := "rfl"
+    }
+  return suggestions
+
+private def splitWhitespace (s : String) : List String
+  := s.splitToList (·.isWhitespace)
+    |>.filter (!·.isEmpty)
+
 def unpack_calc_goal (goal_ty : Expr)
   : MetaM (String × Expr × String × Expr × String) := do
   let some (rel, lhs, rhs) <- Term.getCalcRelation? goal_ty
     | throwError "invalid 'calc' step, relation expected{indentD goal_ty}"
   let app := mkApp2 rel (<- mkFreshExprMVar none) (<- mkFreshExprMVar none)
   let app_s <- ppExpr app <&> toString
-  let some rel_s := (app_s |>.splitOn)[1]?
+  let app_split := splitWhitespace app_s
+  let some rel_s := app_split[1]?
     | throwError "couldn't find relation symbol in {app}"
   let lhs_s := (toString <| <- ppExpr lhs).renameMetaVar
   let rhs_s := (toString <| <- ppExpr rhs).renameMetaVar
@@ -503,5 +573,59 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
         <summary className="mv2 pointer">{.text "🧮 Calculator"}</summary>
         {... body}
       </details>
+
+-- MCP integration: structured suggestion output (no HTML)
+
+-- structure CalcDataParams where
+--   pos : Lsp.Position
+--   selectedLocations : Array GoalsLocation := #[]
+--   deriving RpcEncodable
+
+-- structure SuggestionResult where
+--   hint : String
+--   proof : Option String := none
+--   new_lhs : Option String := none
+--   new_rhs : Option String := none
+--   deriving RpcEncodable
+
+-- @[server_rpc_method]
+-- def calc_suggestions_data : CalcDataParams → RequestM (RequestTask (Array SuggestionResult)) :=
+--   fun params => RequestM.withWaitFindSnapAtPos params.pos fun snap => do
+--     let doc ← RequestM.readDoc
+--     let text := doc.meta.text
+--     let hoverPos := text.lspPosToUtf8Pos params.pos
+--     let goals := snap.infoTree.goalsAt? text hoverPos
+--     match goals with
+--     | [] => return #[]
+--     | { ctxInfo := ci, tacticInfo := ti, useAfter, .. } :: _ =>
+--       let ci' := if useAfter
+--         then { ci with mctx := ti.mctxAfter }
+--         else { ci with mctx := ti.mctxBefore }
+--       let mvs := if useAfter then ti.goalsAfter else ti.goalsBefore
+--       match mvs with
+--       | [] => return #[]
+--       | mv :: _ =>
+--         let suggs ← ci'.runMetaM {} <| mv.withContext do
+--           let mty ← mv.getType''
+--           let some (_, lhs, rhs) ← Term.getCalcRelation? mty
+--             | return #[]
+--           let iGoal ← Widget.goalToInteractive mv
+--           let calcParams : CalcParams := {
+--             pos := params.pos
+--             goals := #[iGoal]
+--             selectedLocations := params.selectedLocations
+--             replaceRange := ⟨⟨0, 0⟩, ⟨0, 0⟩⟩
+--             isFirst := false
+--             indent := 0
+--           }
+--           let suggestions ← all_suggestions iGoal doc calcParams lhs rhs
+--           suggestions.mapM fun s => do
+--             return {
+--               hint := s.hint
+--               proof := s.proof?
+--               new_lhs := ← s.new_lhs?.mapM fun e => return toString (← ppExpr e)
+--               new_rhs := ← s.new_rhs?.mapM fun e => return toString (← ppExpr e)
+--             }
+--         return suggs.toArray
 
 end Tactic.Calculation

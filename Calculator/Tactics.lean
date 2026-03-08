@@ -312,8 +312,9 @@ private partial def splitHyp (fv : FVarId) : Tactic.TacticM Unit :=
           if let some fieldFV := fieldExpr.fvarId? then
             splitHyp fieldFV
       else
-        checkpoint.restore
-    catch | _ => checkpoint.restore
+        failure
+    catch | _ => do
+      checkpoint.restore
 
 elab "unpkg" "[" fv:ident "]" : tactic => Tactic.withMainContext do
   let fvar <- getFVarFromUserName fv.getId

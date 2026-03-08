@@ -12,6 +12,7 @@ namespace Tactic
 namespace Calculation
 
 /- Things I want:
+* Make dsimp / simp / etc work on RHS not just LHS
 
 * 'define' tactic support for constructors with dotted constructors e.g.
     define comp (x.add y) := ...
@@ -30,8 +31,6 @@ namespace Calculation
 
 * Keep track of which "calculation step" was introduced (at meta level?) so that
   we can produce a human-readable / typesetted proof string
-
-* Automatically close any reflexive relation, not just ==, in calc
 
 * Have a tactic / hint for calc mode which tries to apply suggestions, exploring the
   space, until it succeeds (kinda like `grind` etc)
@@ -85,7 +84,8 @@ private def appendToProof (suffix : TacticM (TSyntax `tactic)) (step : Syntax)
     let sf <- suffix
     match step with
     | `(calcStep| $tm := by $prf) | `(calcFirstStep| $tm := by $prf) =>
-      let proof <- withRef prf `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
+      let proof <- withRef prf
+        `(tacticSeq| { ($prf) <;> $(<- withRef prf suffix) })
       .mk <$> `(calcStep| $tm := by $proof)
     | _ => return .mk step
 
