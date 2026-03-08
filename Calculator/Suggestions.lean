@@ -70,32 +70,44 @@ def suggest_apply_hyp : CalcSuggester := fun goal _doc _params lhs _ => do
 
 def simp_cfg : Simp.Config := { singlePass := true }
 
-@[suggest]
-def suggest_dsimp : CalcSuggester
-  := fun _doc _goal _params lhs _rhs => do
-  let simp_ctx <- mkSimpContext (hasStar := true) (cfg := simp_cfg)
-  let (lhs', stats) <- Meta.dsimp lhs simp_ctx
-  if lhs == lhs' then
-    return #[]
-  else if <- isDefEq lhs lhs' then
-    return #[{
-      hint := s!"Simplify: rfl"
-      new_lhs? := lhs'
-      proof? := some "rfl"
-      info? := some (.text "reflexivity")
-    }]
+private def get_dsimp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format)) := do
+  let (exp', stats) <- Meta.dsimp exp ctx
+  if exp == exp' then
+    return none
   else
     let md_ctx := MessageDataContext.mk (<- getEnv) (<- getMCtx) (<- getLCtx) {}
     let thms <- stats.usedTheorems.toArray.mapM fun o => do
       let md <- ppOrigin o
       md.format md_ctx
     let fmt := Format.joinSep thms.toList ", "
-    return #[{
-      hint := "Simplify: dsimp"
+    return some (exp', fmt)
+
+@[suggest]
+def suggest_dsimp : CalcSuggester
+  := fun _doc _goal _params lhs rhs => do
+  let simp_ctx <- mkSimpContext (hasStar := true) (cfg := simp_cfg)
+  let lhs_result <- get_dsimp simp_ctx lhs
+  let rhs_result <- get_dsimp simp_ctx rhs
+  let lhss <- lhs_result.toArray.mapM fun (lhs', fmt) => do
+    if <- isDefEq lhs lhs' then return ({
+      hint := "Simplify: rfl"
+      new_lhs? := lhs'
+      proof? := some "rfl"
+      info? := some (.text "reflexivity")
+    } : Suggestion)
+    else return ({
+      hint := "Simplify LHS: dsimp"
       new_lhs? := lhs'
       info? := some <span className="font-code">{.text fmt.pretty}</span>
       proof? := some s!"dsimp only [{fmt}]"
-    }]
+    } : Suggestion)
+  let rhss := rhs_result.toArray.map fun (rhs', fmt) => ({
+    hint := "Simplify RHS: dsimp"
+    new_rhs? := rhs'
+    info? := some <span className="font-code">{.text fmt.pretty}</span>
+    proof? := some s!"dsimp only [{fmt}]"
+  } : Suggestion)
+  return lhss ++ rhss
 
 def get_simp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format)) := do
   let (res, stats) <- Meta.simp exp ctx

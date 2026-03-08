@@ -38,8 +38,6 @@ namespace Calculation
 * If we've partially refined the proof of a step by hand (i.e. written some tactics) but it's
   not closed yet, the suggester still makes suggestions, but they are not applied properly.
 
-* We can reduce definitions on selected subterms, but we should be able to do the
-  opposite too!
 -/
 
 set_option linter.style.multiGoal false
