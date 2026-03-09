@@ -17,9 +17,6 @@ namespace Calculation
 * 'define' tactic support for constructors with dotted constructors e.g.
     define comp (x.add y) := ...
 
-* 'define' tactic support for pattern matching in non-constructor arguments e.g.
-    define exec (.add c') (m :: n :: s) := exec c' ((n + m) :: s)
-
 * let the define suggester discover definitions which are more general, and
   require us to abstract from terms, e.g
     exec c ((eval x + eval y) :: s) = exec c.add (eval y :: eval x :: s)

@@ -31,6 +31,17 @@ def revCalc {a} : RevSpec a := by
     _ = fastrev (x :: xs) ys
       := by define fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
+def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
+
+def test {a} : List a -> List a -> List a := by
+  calculate ⊢ as f
+  refine f => apply List.rec
+  define f [] ys := ys
+  define f (x::xs) ys := f xs ys
+
+#print test
+#eval test [1, 2] [4, 5]
+
 inductive Exp : Type
   | val : Nat -> Exp
   | add : Exp -> Exp -> Exp
@@ -71,16 +82,17 @@ def comp_calc : CompSpec := by
       := by define exec (Code.push n c) s := exec c (n :: s)
     _ = exec (comp (Exp.val n) c) s
       := by define comp (Exp.val n) c := (Code.push n c)
+  -- Case add x y:
   case add x y ih_x ih_y => calc
     exec c (eval (Exp.add x y) :: s)
     _ = exec c ((eval x + eval y) :: s) := by rfl
     _ = exec (Code.add c) (eval x :: eval y :: s)
-      := by define exec (.add c) s := match s with
-          | (m::n::s) => exec c ((m + n) :: s)
-          | _ => don't care
+      := by define partial exec (.add c) (m :: n :: s) := exec c ((m + n) :: s)
     _ = exec (comp x (Code.add c)) (eval y :: s) := by simp only [ih_x]
     _ = exec (comp y (comp x (Code.add c))) s := by simp only [ih_y]
     _ = exec (comp (Exp.add x y) c) s
       := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
   case halt =>
     exact id
+
+#print comp_calc

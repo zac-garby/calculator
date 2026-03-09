@@ -108,40 +108,43 @@ def desugar_clause_def
   (con_args rest_args : List Name) -- the args for the recursor, but without the IH's
   (to_term : TSyntax `term)
   : Tactic.TacticM Expr := do
-  let search_fn <- elabTerm (mkIdent clause_of) none
+  -- Look up the function mvar directly so we don't depend on it being in
+  -- scope in the current goal's local context (sub-goals created by
+  -- apply/refine don't inherit the calculate let-binding).
   let clause_ty <- inferType clause
   let (clause_args, _, _) <- forallMetaTelescopeReducing clause_ty
   let ns <- desugar_clause_args inp_ty con_args clause_args.toList
-  let body_args := ns ++ rest_args
-  let body_node : TSyntax `term <- `(fun $(stx_from_names body_args)* => $to_term)
-  let body_fn <- elabTerm body_node (some clause_ty)
-  Meta.transform body_fn <| fun e => do
-    -- if we find an 'e' which is an application of the function being defined...
-    if <- isDefEq e.getAppFn search_fn then
-      let ((.fvar fv)::args) := e.getAppArgs.toList
-        | throwError "can't make recursive call: {<- ppExpr e}"
-      let arg_name <- fv.getUserName
-      let rec_name := get_rec_name arg_name
-      let lctx <- getLCtx
-      for fv in lctx.getFVars do
-        if (<- fv.fvarId!.getUserName) = rec_name then
-          let e := mkAppN fv args.toArray
-          return .visit e
-      throwError "didn't find {rec_name} as a fv (bug!)"
-    return .continue
-
-def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit := do
-  let mctx <- getMCtx
-  match mctx.findUserName? bind_name with
-  | none => throwUnknownNameWithSuggestions bind_name
-  | some mv => do
-    if (<- mv.getTag) == bind_name then do
-      if <- mv.isAssigned then
-        if !(<- isDefEq (.mvar mv) to_expr) then
-          throwError m!"cannot re-define {<- mv.getTag} as {to_expr}\n\
-          (already assigned to {<- ppExpr (.mvar mv)})"
+  let body_node : TSyntax `term <- `(fun $(stx_from_names (ns ++ rest_args))* => $to_term)
+  let body_node_rw <- body_node.raw.rewriteBottomUpM fun
+    | stx@`($f:ident $arg0:term $args:term*) => do
+      if f.getId == clause_of then
+        let `($arg_id:ident) := arg0
+          | throwErrorAt arg0 "can't make recursive call on non-variable-name argument"
+        let arg_name := arg_id.getId
+        let rec_name := get_rec_name arg_name
+        `($(mkIdent rec_name) $args*)
       else
-        mv.assignIfDefEq to_expr
+        return stx
+    | s => pure s
+  let body_fn <- elabTerm body_node_rw (some clause_ty)
+  return body_fn
+
+partial def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit :=
+  go bind_name
+where
+  go (name : Name) : Tactic.TacticM Unit := do
+    let mctx <- getMCtx
+    match mctx.findUserName? name with
+    | none =>
+      if name == bind_name then throwUnknownNameWithSuggestions bind_name
+      else throwError m!"{bind_name} is already fully defined (no 'else' slot available)"
+    | some mv => do
+      if (<- mv.getTag) == name then do
+        if <- mv.isAssigned then
+          -- Redirect to the chained else-mvar introduced by 'define only'
+          go (Name.str name "else")
+        else
+          mv.assignIfDefEq to_expr
 
 def count_implicit_args (ty : Expr) : Nat := match ty with
   | .forallE _ _ b .implicit => 1 + count_implicit_args b
@@ -170,10 +173,38 @@ def collect_ctor_pattern (stx : Syntax) : TermElabM (Syntax × Array Name) := do
   else
     throwErrorAt stx "unexpected syntax in pattern: {stx.getKind.toString}"
 
-elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:term : tactic
+def inhabit_mv (mv : MVarId) : MetaM Bool := do
+  let ty <- mv.getType
+  let inst_ty <- mkAppM ``Inhabited #[ty]
+  if let some inst <- synthInstance? inst_ty then
+    let e <- mkAppOptM ``Inhabited.default #[ty, inst]
+    mv.assignIfDefEq e
+    return true
+  else
+    return false
+
+/--
+Provides a (partial) definition of a function being calculated.
+
+* `define foo (.con x y) a b = ...` provides a definition for the `.con` constructor
+  case of the function `foo`.
+
+  There must be a metavariable named `foo.con`, typically arising
+  from `refine foo => apply MyType.rec`.
+
+* `define only ...` does the same thing, but doesn't automatically close the current
+  goal.
+
+* `define partial ...` allows further pattern matching on subsequent arguments, as long
+  as we are okay with the resulting function being partial.
+-/
+elab (name := defineTactic)
+  "define" only:("only")? part:("partial")? p:term " := " to_term:term : tactic
   => do
   let main_goal <- Tactic.withMainContext Tactic.getMainGoal
   let mctx <- Tactic.withMainContext getMCtx
+  let is_only := only.isSome
+  let is_partial := part.isSome
   match p with
   | `($f:ident) => do
     let (some mv) := mctx.findUserName? f.getId
@@ -201,21 +232,109 @@ elab (name := defineTacticSugared) "define" mod:("only")? p:term " := " to_term:
     | _ => throwErrorAt pat "expected a constructor, but got {con_fn}"
     let mctx <- getMCtx
     let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
-      | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat})"
-    let rest_names <- rest.toList.mapM fun s => match s.raw with
-      | `($i:ident) => pure i.getId
-      | s => throwErrorAt s "expected an ident (matching on 'define' arguments is not allowed yet)"
+      | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat}"
+    -- Collect (name, optional_pattern) for each rest arg.
+    -- Plain idents become a binder name. Any other syntax becomes a
+    -- fresh binder name + a pattern that wraps to_term in a match.
+    let restInfo <- rest.toList.mapM fun s => do
+      match s.raw with
+      | `($i:ident) => pure (i.getId, (none : Option (TSyntax `term)))
+      | _ => do
+        let fresh <- mkFreshUserName (.mkSimple "arg")
+        pure (fresh, some ⟨s.raw⟩)
+    let rest_names := restInfo.map (·.fst)
+    -- Whether any rest arg uses a pattern (vs plain ident).
+    let hasPatternArgs := restInfo.any (·.snd.isSome)
+    -- Name of the first (leftmost/outermost) pattern arg — its else arm gets a
+    -- named hole when using 'define only', so a subsequent 'define' can fill it.
+    let firstPatName? := restInfo.findSome? fun (n, p?) => if p?.isSome then some n else none
+    let else_clause_name := Name.str clause_name "else"
+    -- Use a fresh uniquely-named hole for the outermost else arm in 'define only'.
+    -- We name it so we can look it up in the mctx by userName after elaboration.
+    let hole_user_name <- if /- is_only && -/ hasPatternArgs
+        then mkFreshUserName `else
+        else pure .anonymous
+    let holeId : Ident := mkIdent hole_user_name
+    -- Wrap to_term in match expressions for all pattern args (right fold,
+    -- so the first pattern arg becomes the outermost match).
+    let to_term' <- restInfo.foldrM (fun (name, pat?) acc => do
+      match pat? with
+      | none => pure acc
+      | some pat =>
+        let nameId : Ident := mkIdent name
+        if is_partial then
+          let elseArm : TSyntax `term <-
+            if firstPatName? == some name then `(?$holeId:ident)
+            else `(don't care)
+          `(match $nameId:ident with | $pat:term => $acc | _ => $elseArm)
+        else
+          `(match $nameId:ident with | $pat:term => $acc))
+      to_term
+    -- Capture outer lctx (before lambda binders are added by desugar_clause_def).
+    let outer_lctx <- Tactic.withMainContext getLCtx
     -- construct a new function, 'fn', to define as the body
     let fn <- Tactic.withMainContext <| desugar_clause_def
       f.getId clause_expr inp_ty
-      con_arg_names.toList rest_names to_term
-    define_mv clause_name fn
-    if !mod.isSome then
+      con_arg_names.toList rest_names to_term'
+    -- When 'define partial is used with pattern args, post-process fn to replace
+    -- the named hole ?holeName with `(else_mv arg₁ arg₂ ...)`.
+    -- We do this inside Meta.transform so the lambda binders are fresh FVars that
+    -- get re-abstracted to de Bruijn by the transform — no dangling FVar refs.
+    let fn' <- if is_partial && hasPatternArgs then Tactic.withMainContext do
+      let mctx <- getMCtx
+      let some hole_mv_id := mctx.findUserName? hole_user_name
+        | throwError m!"internal: 'define' hole mvar not found named '{hole_user_name}'"
+      -- If the hole is inhabited, then we just use the default value for it, since it
+      -- doesn't matter anyway.
+      if <- inhabit_mv hole_mv_id then
+        return fn
+      -- Collect clause arg types for matching against lambda binder FVars.
+      let clause_ty <- inferType clause_expr
+      let mut clause_arg_types : Array Expr := #[]
+      let mut peel_ty := clause_ty
+      while peel_ty.isForall do
+        let .forallE _ arg_ty body _ := peel_ty | break
+        clause_arg_types := clause_arg_types.push arg_ty
+        peel_ty := body
+      -- Create else_mv so it exists as a mvar ref in the resulting fn'.
+      let else_mv <- mkFreshExprMVar clause_ty (userName := else_clause_name)
+      -- Replace the hole with (else_mv binder_fvar_c binder_fvar_arg ...).
+      -- Meta.transform opens each lambda with fresh FVars, then re-abstracts them
+      -- to .bvar N — so the result is a closed de Bruijn expression.
+      Tactic.appendGoals [hole_mv_id]
+      Meta.transform fn (fun e => do
+        if let .mvar mv := e then
+          if mv == hole_mv_id then
+            let lctx <- getLCtx
+            -- Lambda binder FVars = those in current lctx not in the outer (main goal) lctx.
+            let binders := (lctx.decls.toList.filterMap fun d? =>
+              d?.filter fun d => !outer_lctx.contains d.fvarId).toArray
+            let mut used := Array.replicate binders.size false
+            let mut apply_fvars : Array Expr := #[]
+            for arg_ty in clause_arg_types do
+              let mut found : Option (Nat × Expr) := none
+              for i in [:binders.size] do
+                if !used[i]! then
+                  let d_ty <- inferType binders[i]!.toExpr
+                  if ← isDefEq d_ty arg_ty then
+                    found := some (i, binders[i]!.toExpr)
+                    break
+              match found with
+              | some (i, e) =>
+                apply_fvars := apply_fvars.push e
+                used := used.set! i true
+              | none =>
+                throwError m!"internal: no binder FVar of type {← ppExpr arg_ty} for else-arm"
+            return .done (mkAppN else_mv apply_fvars)
+        return .continue)
+    else pure fn
+    define_mv clause_name fn'
+    if !is_only then
       main_goal.withContext do
         Tactic.evalTactic (<- `(tactic| try rfl))
   | _ => throwUnsupportedSyntax
 
-#allow_unused_tactic! defineTacticSugared
+#allow_unused_tactic! defineTactic
 
 def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
   : Tactic.TacticM FVarId := do
@@ -245,6 +364,19 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
   let field_ty <- inferType field >>= instantiateMVars
   calc_intro_other as_name field_ty
 
+/--
+Refine some metavariables by applying a tactic.
+
+Typically used in calculations, for instance:
+
+  ```lean
+  calculate comp
+  refine comp => apply Exp.rec
+  ```
+
+`calculate comp` introduces a metavar named `comp`, which is then refined
+into a recursive definition with a new metavar for each constructor's case.
+-/
 elab "refine " vs:ident,* " => " tac:tactic : tactic => Tactic.withMainContext do
   let ids <- vs.getElems.mapM fun v => do
     let id := v.getId
@@ -266,6 +398,18 @@ declare_syntax_cat calc_name
 syntax ident : calc_name
 syntax ident "as" ident : calc_name
 
+/--
+Introduce a calculation for the current goal.
+
+ * `calculate x, y, z` introduces calculation targets for fields `x` `y` and `z`,
+   if the current goal is a structure with such named fields.
+
+ * `calculate x as foo` lets us locally alias these calculation target names. Useful
+   with products, e.g. `calculate fst as my_function`.
+
+ * `calculate ⊢ as foo`, a special case where the goal isn't a structure, and instead
+   we simply make the entire goal into a calculation target named `foo`.
+-/
 elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.withMainContext do
   -- look at main goal, get its fields
   let main_goal <- Tactic.getMainGoal
@@ -296,6 +440,13 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
       if (<- field_mv.getTag) == field_name then
         field_mv.assign val
         field_mv.setUserName as_name
+
+@[inherit_doc calculateTactic]
+elab (name := calculateGoal) "calculate" "⊢" "as" r:ident : tactic => Tactic.withMainContext do
+  let main_goal <- Tactic.getMainGoal
+  main_goal.setUserName r.getId
+
+#allow_unused_tactic! calculateGoal
 
 macro "exists_mono" : tactic =>
   `(tactic| (repeat' apply Exists.imp; intro))
