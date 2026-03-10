@@ -90,10 +90,10 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
             let rhs'_s := (toString <| <- ppExpr rhs').renameMetaVar
             let new_line := if params.isFirst
               then s!"{lhs_s}\n{spc}\
-                      _ {rel} {lhs'_s} := by {no_proof}\n{spc}\
+                      _ {rel} {lhs'_s} := by {proof_s}\n{spc}\
                       _ {rel} {rhs'_s} := by {no_proof}\n{spc}\
                       _ {rel} {rhs_s} := by {no_proof}"
-              else s!"_ {rel} {lhs'_s} := by {no_proof}\n{spc}\
+              else s!"_ {rel} {lhs'_s} := by {proof_s}\n{spc}\
                       _ {rel} {rhs'_s} := by {no_proof}\n{spc}\
                       _ {rel} {rhs_s} := by {no_proof}"
             pure (new_line,

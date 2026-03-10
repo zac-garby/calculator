@@ -325,17 +325,15 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => d
 
 @[suggest]
 def factor_common_subexpr : CalcSuggester :=
-  lift_let <| fun _goal _doc _params lhs rhs => do
-    let common <- Rewrites.getSubexpressionMatches (fun e => do
-      if e.occurs rhs then
-        return if (<- care_about e) then #[e] else #[]
-      else
-        return #[]) lhs
+  lift_let <| fun goal _doc params lhs rhs => do
+    let selected <- get_selected_exprs params (<- goal.mvarId.getType)
+    if selected.isEmpty then return #[]
+    let common := selected.filter fun e => e.occurs lhs && e.occurs rhs
     common
-      |>.toList
-      |>.mergeSort (fun e1 e2 => e2.approxDepth < e1.approxDepth)
-      |>.eraseDupsBy (fun e1 e2 => e1.occurs e2 || e2.occurs e1)
-      |>.toArray
+      -- |>.toList
+      -- |>.mergeSort (fun e1 e2 => e2.approxDepth < e1.approxDepth)
+      -- |>.eraseDupsBy (fun e1 e2 => e1.occurs e2 || e2.occurs e1)
+      -- |>.toArray
       |>.mapM fun e => do
       let t <- inferType e
       let lhs' := lhs.replace fun e' => if e == e' then Expr.bvar 0 else none
@@ -344,13 +342,8 @@ def factor_common_subexpr : CalcSuggester :=
         hint := s!"Factor common: '{<- ppExpr e}'"
         new_lhs? := Expr.letE `u t e lhs' false
         new_rhs? := Expr.letE `u t e rhs' false
+        proof? := "rfl"
       }
-  where care_about (e : Expr) := do
-    let args := e.getAppArgs'
-    let e_ty <- inferType e
-    if e_ty.isArrow || args.isEmpty then return false
-    let fn_ty <- inferType (e.getAppFn)
-    return args.size = count_args fn_ty
 
 @[suggest]
 def suggest_cong : CalcSuggester :=
