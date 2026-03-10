@@ -1,6 +1,5 @@
 import Calculator.Calculator
 import Mathlib.Tactic.Common
-import Mathlib.Tactic.Order
 
 namespace Calculator.Example.Rel
 
@@ -105,8 +104,6 @@ instance : IsPreorder Prop impR where
 end Implication
 
 section Calculations
-
-open Lean PrettyPrinter Delaborator SubExpr
 
 -- @[delab app.Calculator.Example.Rel.Tm.ofVal]
 -- def delabFoo : Delab := withAppArg delab

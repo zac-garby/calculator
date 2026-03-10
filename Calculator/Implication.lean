@@ -16,4 +16,4 @@ instance : IsTrans Prop impR where trans _ _ _ p q := p ∘ q
 instance : Std.Refl impR where refl := rfl_impR
 instance : IsPreorder Prop impR where
 
-namespace Calculator.Syntax.Implication
+end Calculator.Syntax.Implication

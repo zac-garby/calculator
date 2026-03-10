@@ -1,15 +1,11 @@
 import Mathlib.Tactic.Common
-import Mathlib.Util.CompileInductive
-import Calculator.Suggestions
+import Calculator.Suggestions.Widget
 import Calculator.Tactics
-
-open Nat
-open Option
-open List
-open Lean Meta Elab Term Macro Command Tactic
 
 namespace Tactic
 namespace Calculation
+
+open Lean Meta Elab Tactic
 
 /- Things I want:
 * Make dsimp / simp / etc work on RHS not just LHS
@@ -87,6 +83,7 @@ private def appendToProof (suffix : TacticM (TSyntax `tactic)) (step : Syntax)
 elab_rules : tactic
 | `(tactic|calc%$calcstx $steps) => do
   let mut isFirst := true
+  dbg_trace f!"elab a calc"
   for step in <- Lean.Elab.Term.mkCalcStepViews steps do
     let some replaceRange := (<- getFileMap).lspRangeOfStx? step.ref | continue
     let json := json% {
@@ -95,22 +92,24 @@ elab_rules : tactic
       "indent": $(replaceRange.start.character)
     }
     Widget.savePanelWidgetInfo panel.javascriptHash (pure json) step.proof
+    dbg_trace f!"saved panel widget info at {step.proof}"
     isFirst := false
   let suffix <- getCloserSuffix
-  let steps <- if let some suffix := suffix then
-    match steps with
-    | `(calcSteps|
-        $step0:calcFirstStep
-        $rest*) => do
-      let step0' <- appendToProof suffix step0
-      let rest' <- rest.mapM (appendToProof suffix)
-      `(calcSteps|
-        $step0'
-        $rest'*)
-    | _ => do
-      logWarningAt steps "tried to add suffix to steps, but couldn't match. bug?"
-      pure steps
-    else pure steps
+  -- let steps <- if let some suffix := suffix then
+  --   match steps with
+  --   | `(calcSteps|
+  --       $step0:calcFirstStep
+  --       $rest*) => do
+  --     let step0' <- appendToProof suffix step0
+  --     let rest' <- rest.mapM (appendToProof suffix)
+  --     `(calcSteps|
+  --       $step0'
+  --       $rest'*)
+  --   | _ => do
+  --     logWarningAt steps "tried to add suffix to steps, but couldn't match. bug?"
+  --     pure steps
+  --   else pure steps
+  dbg_trace f!"done, now elabbing calc"
   evalCalc (<- `(tactic|calc%$calcstx $steps))
 
 elab stx:"calc?" : tactic => Tactic.withMainContext do

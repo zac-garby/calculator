@@ -1,6 +1,4 @@
 import Mathlib.Tactic.Common
-import Mathlib.Util.CompileInductive
-import ProofWidgets.Data.Html
 
 namespace Tactic.Calculation
 
@@ -9,7 +7,7 @@ set_option linter.style.setOption false
 set_option pp.fieldNotation false
 
 open Option List
-open Lean Meta Elab Term Macro Command Mathlib.Tactic Qq
+open Lean Meta Elab Term Macro Mathlib.Tactic Qq
 
 macro "don't" "care" : term => `(panic! "found out the hard way that we do actually care")
 
@@ -149,6 +147,11 @@ where
 def count_implicit_args (ty : Expr) : Nat := match ty with
   | .forallE _ _ b .implicit => 1 + count_implicit_args b
   | .lam _ _ b .implicit => 1 + count_implicit_args b
+  | _ => 0
+
+def count_args (ty : Expr) : Nat := match ty with
+  | .forallE _ _ b _ => 1 + count_args b
+  | .lam _ _ b _ => 1 + count_args b
   | _ => 0
 
 partial def get_id (stx : Syntax) : Option Name := match stx.getKind with
@@ -316,7 +319,7 @@ elab (name := defineTactic)
               for i in [:binders.size] do
                 if !used[i]! then
                   let d_ty <- inferType binders[i]!.toExpr
-                  if ← isDefEq d_ty arg_ty then
+                  if <- isDefEq d_ty arg_ty then
                     found := some (i, binders[i]!.toExpr)
                     break
               match found with
@@ -324,7 +327,7 @@ elab (name := defineTactic)
                 apply_fvars := apply_fvars.push e
                 used := used.set! i true
               | none =>
-                throwError m!"internal: no binder FVar of type {← ppExpr arg_ty} for else-arm"
+                throwError m!"internal: no binder FVar of type {<- ppExpr arg_ty} for else-arm"
             return .done (mkAppN else_mv apply_fvars)
         return .continue)
     else pure fn

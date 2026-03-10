@@ -1,5 +1,6 @@
 import Calculator.Calculator
 import Mathlib.Tactic.Common
+import Mathlib.Util.CompileInductive
 
 open Tactic.Calculation
 
@@ -24,8 +25,7 @@ def revCalc {a} : RevSpec a := by
   case cons x xs ih => calc
     rev (x :: xs) ++ ys
     _ = rev xs ++ [x] ++ ys := by rfl
-    _ = rev xs ++ ([x] ++ ys)
-      := by simp only [List.append_assoc]
+    _ = rev xs ++ ([x] ++ ys) := by simp only [List.append_assoc]
     _ = fastrev xs ([x] ++ ys) := by rw [ih]
     _ = fastrev xs (x :: ys) := by rfl
     _ = fastrev (x :: xs) ys
@@ -68,6 +68,24 @@ structure CompSpec where
   exec : Code -> Stack -> Stack
   correct : ∀ e c s, exec c (eval e :: s) = exec (comp e c) s
 
+open Lean Elab
+
+syntax (name := myWith) "with " (ident " := " term),* "; " term : term
+@[term_elab myWith]
+def with_elab : Term.TermElab := fun stx ty => match stx with
+  | `(with $[$ns:ident := $vs:term],*; $body) => do
+    let stx <- ns.zip vs |>.foldlM (fun s (n, v) => `(let $n := $v; $(.mk s))) body
+    Term.elabTerm stx ty
+  | _ => throwUnsupportedSyntax
+
+#check let x := 5; x * 2
+
+-- @[delab letE]
+-- def delab_let : Delab := do
+--   let e <- SubExpr.getExpr
+--   inside_let e fun body vs => do vs.foldlM (fun s (n, v) => do
+--     `(with $(mkIdent n) := $(<- delab v); $s)) (<- delab body)
+
 def comp_calc : CompSpec := by
   calculate comp, exec
   refine comp => apply Exp.rec
@@ -86,13 +104,29 @@ def comp_calc : CompSpec := by
   case add x y ih_x ih_y => calc
     exec c (eval (Exp.add x y) :: s)
     _ = exec c ((eval x + eval y) :: s) := by rfl
-    _ = exec (Code.add c) (eval x :: eval y :: s)
-      := by define partial exec (.add c) (m :: n :: s) := exec c ((m + n) :: s)
+    _ = exec (.add c) (eval x :: eval y :: s)
+      := by todo
     _ = exec (comp x (Code.add c)) (eval y :: s) := by simp only [ih_x]
     _ = exec (comp y (comp x (Code.add c))) s := by simp only [ih_y]
     _ = exec (comp (Exp.add x y) c) s
       := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
   case halt =>
     exact id
+
+def eg : 5 + (2 + 3) = n + (2 + 3) := by
+  calc
+    5 + (2 + 3) = n + (2 + 3) := by todo
+
+/-
+  case add x y ih_x ih_y => calc
+    exec c (eval (Exp.add x y) :: s)
+    _ = exec c ((eval x + eval y) :: s) := by rfl
+    _ = exec (.add c) (eval x :: eval y :: s)
+      := by define partial exec (.add c) (m :: n :: s) := exec c ((m + n) :: s)
+    _ = exec (comp x (Code.add c)) (eval y :: s) := by simp only [ih_x]
+    _ = exec (comp y (comp x (Code.add c))) s := by simp only [ih_y]
+    _ = exec (comp (Exp.add x y) c) s
+      := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
+-/
 
 #print comp_calc

@@ -1,7 +1,6 @@
 import Calculator.Calculator
 import Calculator.Implication
 import Mathlib.Tactic.Common
-import Mathlib.Tactic.Order
 
 set_option linter.unusedTactic false
 
@@ -114,13 +113,13 @@ def semTy.add : Σ' (p : Prop), p -> ⊨ e + e' : t := by
     ⊨ e + e' : t
     _ <- ∃ v, e + e' ⇓ v ∧ v ∈ t
       := by rfl
-    _ <- ∃ (v : Val) (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
+    _ <- ∃ (v : Val) (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
       := by restructuring
-    _ <- ∃ (n n' : ℤ), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
+    _ <- ∃ (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
       := by restructuring
-    _ <- ∃ (n n' : ℤ), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
+    _ <- ∃ (n n' : Int), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
       := by restructuring
-    _ <- (∃ (n : ℤ), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : ℤ), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
+    _ <- (∃ (n : Int), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : Int), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
       := by restructuring
     _ <- ⊨ e : .Int ∧ ⊨ e' : .Int ∧ t = .Int
       := by restructuring

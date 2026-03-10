@@ -1,8 +1,6 @@
 import Calculator.Calculator
 import Mathlib.Tactic.Common
 
-open Tactic.Calculation
-
 namespace Improvement
 
 open Lean Elab

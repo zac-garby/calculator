@@ -1,2 +1,1 @@
-import Calculator.Example
-import Calculator.ExampleRel
+import Example.Example

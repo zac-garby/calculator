@@ -3,7 +3,7 @@ import ProofWidgets.Data.Html
 
 namespace Tactic.Calculation
 
-open Lean Meta ProofWidgets.Jsx ProofWidgets Server.Snapshots Server
+open Lean Meta ProofWidgets Server.Snapshots Server
 
 structure CalcParams extends SelectInsertParams where
   isFirst : Bool
@@ -20,8 +20,7 @@ structure Suggestion where
 
 instance : BEq Suggestion where
   beq s1 s2
-    := s1.hint == s2.hint
-    && s1.new_lhs? == s2.new_lhs?
+    := s1.new_lhs? == s2.new_lhs?
     && s1.new_rhs? == s2.new_rhs?
     && s1.proof? == s2.proof?
 
@@ -45,15 +44,5 @@ initialize registerBuiltinAttribute {
     ensureAttrDeclIsPublic `suggest name kind
     setEnv (suggester_ext.addEntry (<- getEnv) name)
 }
-
-def all_suggestions : CalcSuggester := fun doc params goal lhs rhs => do
-  let env <- getEnv
-  let sugg_names := suggester_ext.getState env
-  let suggs <- sugg_names.foldlM (init := #[]) fun acc n => do
-    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
-    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
-    let suggs <- f doc params goal lhs rhs
-    pure (acc ++ suggs)
-  pure suggs.toList.eraseDups.toArray
 
 end Tactic.Calculation
