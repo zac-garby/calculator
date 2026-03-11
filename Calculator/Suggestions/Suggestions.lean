@@ -9,18 +9,14 @@ namespace Tactic.Calculation
 
 open Lean Meta Elab Term ProofWidgets Jsx SelectInsertParamsClass SubExpr Server
 
+def todo : MetaM (TSyntax `tactic) := `(tactic| todo)
+
 def sep (s : String := "8px") : Html := <span style={json% { marginRight: $s }} />
 
 def with_extra (edits : Array Lsp.TextEdit)
   (props : MakeEditLinkProps) : MakeEditLinkProps :=
   { props with edit := { props.edit with edits
     := (props.edit.edits.append edits) } }
-
-def pretty_mvars (s : String) : String :=
-  match s.splitOn "?m." with
-  | [] => ""
-  | [s] => s
-  | s::ss => s ++ "(⋯)" ++ "(⋯)".toSlice.intercalate (ss.map fun s ↦ s.dropWhile Char.isDigit)
 
 partial def inside_let {a}
   (e : Expr) (f : Expr -> List (Name × Expr) -> MetaM a) (vs : List (Name × Expr) := []) : MetaM a
@@ -46,6 +42,7 @@ partial def unzip_lets {a}
         unzip_lets body_l body_r f ((name, ty, val, x) :: vs)
   | _, _ => f (inst_let_body l vs) (inst_let_body r vs) vs.toArray
 
+/-- Lift a suggester through shared let-bindings on lhs and rhs. -/
 def lift_let (s : CalcSuggester) : CalcSuggester := fun goal doc params lhs rhs =>
   unzip_lets lhs rhs fun lhs' rhs' vs => do
     let vs' := vs.toList
@@ -53,189 +50,80 @@ def lift_let (s : CalcSuggester) : CalcSuggester := fun goal doc params lhs rhs 
     let rhs' := inst_let_body rhs' vs'
     let suggs <- s goal doc params lhs' rhs'
     return suggs.map fun sugg => { sugg with
-      new_lhs? := sugg.new_lhs?.map (letify vs')
-      new_rhs? := sugg.new_rhs?.map (letify vs')
+      intermediates := sugg.intermediates.map fun (e, p) => (letify vs' e, p)
     }
-  where letify (vs : List (Name × Expr × Expr × Expr)) (body : Expr) : Expr
+  where
+    letify (vs : List (Name × Expr × Expr × Expr)) (body : Expr) : Expr
     := match vs with
        | [] => body
        | (n, t, v, x) :: vs =>
-        let fv := x.fvarId!
-        let body := FVarSubst.apply
-          (.empty |>.insert fv (.bvar 0))
-          (body.liftLooseBVars 0 1)
+        let body := body.abstract #[x]
         .letE n t v (letify vs body) false
 
 def expr_component (e : Expr) : MetaM Html :=
   inside_let e fun e vs => do
-    if e.hasExprMVar then
-      let mut str := toString <| <- ppExpr e
-      str := pretty_mvars str
-      if !vs.isEmpty then str := s!"let ⋯; {str}"
-      return <span className="font-code">{.text str}</span>
-    else
-      let e' <- WithRpcRef.mk (<- ExprWithCtx.save e)
-      return <span className="font-code">
-        {if vs.isEmpty then .text "" else .text "let ⋯; "}
-        {.ofComponent InteractiveExpr { expr := e' } #[]}
-      </span>
+    let eRef <- WithRpcRef.mk (<- ExprWithCtx.save e)
+    return <span className="font-code">
+      {if vs.isEmpty then .text "" else .text "let ⋯; "}
+      {.ofComponent InteractiveExpr { expr := eRef } #[]}
+    </span>
 
-def all_suggestions : CalcSuggester := fun doc params goal lhs rhs => do
-  let env <- getEnv
-  let sugg_names := suggester_ext.getState env
-  let suggs <- sugg_names.foldlM (init := #[]) fun acc n => do
-    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
-    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
-    let suggs <- f doc params goal lhs rhs
-    pure (acc ++ suggs)
-  pure suggs.toList.eraseDups.toArray
+private def get_selections (locs : Array GoalsLocation) : (Array Pos × Bool × Bool) :=
+  let subs := getGoalLocations locs
+  let sel_left := subs.any fun L => #[0, 1].isPrefixOf L.toArray
+  let sel_right := subs.any fun L => #[1].isPrefixOf L.toArray
+  (subs, sel_left, sel_right)
 
-@[suggest]
-def suggest_already_eq : CalcSuggester := fun _goal _doc _params lhs rhs => do
-  if <- withNewMCtxDepth (isDefEq lhs rhs) then
-    return #[{
-      hint := "Already equal"
-    }]
-  else
-    return #[]
-
-@[suggest]
-def suggest_apply_hyp : CalcSuggester := lift_let <| fun goal _doc _params lhs _ => do
-  let mv := goal.mvarId
-  let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
-  let mut suggestions : Array Suggestion := #[]
-  for i in lctx.decls do
-    let some d := i | continue
-    try
-      let r <- mv.rewrite lhs d.toExpr
-      suggestions := suggestions.push {
-        hint := "Apply hypothesis"
-        info? := some
-          <span>
-            <strong className="goal-hyp">
-              {.text (toString f!"{d.userName}")}
-            </strong>
-          </span>
-        new_lhs? := r.eNew
-        proof? := some s!"rw [{d.userName}]"
-      }
-    catch | _ => pure ()
-  return suggestions
+/-- Pretty-print a tactic syntax node to a string using reprint. -/
+def ppTactic (tac : TSyntax `tactic) : MetaM Html := do
+  let fmt <- PrettyPrinter.ppTactic tac
+  let str := fmt.pretty (width := 80)
+  return <span className="font-code">{.text str}</span>
 
 def simp_cfg : Simp.Config := { singlePass := true }
 
-private def get_dsimp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format)) := do
+/-- Parse a tactic string into TSyntax. -/
+private def strToTactic (s : String) : MetaM (TSyntax `tactic) := do
+  match Lean.Parser.runParserCategory (<- getEnv) `tactic s with
+  | .ok stx => return ⟨stx⟩
+  | .error e => throwError "strToTactic: {e}"
+
+private def get_dsimp (ctx : Simp.Context) (exp : Expr)
+    : MetaM (Option (Expr × TSyntax `tactic)) := do
   let (exp', stats) <- Meta.dsimp exp ctx
-  if exp == exp' then
-    return none
-  else
-    let md_ctx := MessageDataContext.mk (<- getEnv) (<- getMCtx) (<- getLCtx) {}
-    let thms <- stats.usedTheorems.toArray.mapM fun o => do
-      let md <- ppOrigin o
-      md.format md_ctx
-    let fmt := Format.joinSep thms.toList ", "
-    if thms.isEmpty then return none
-    return some (exp', fmt)
+  if exp == exp' then return none
+  let origins := stats.usedTheorems.toArray
+  if origins.isEmpty then return none
+  let mut names : List String := []
+  for o in origins do
+    match o with
+    | .decl n _ _  => names := names ++ [toString n]
+    | .fvar fv     => names := names ++ [toString (<- fv.getDecl).userName]
+    | .stx _ syn   =>
+      let n := syn.getId
+      unless n.isAnonymous do names := names ++ [toString n]
+    | .other _     => pure ()
+  if names.isEmpty then return none
+  return some (exp', <- strToTactic s!"dsimp only [{", ".intercalate names}]")
 
-@[suggest]
-def suggest_dsimp : CalcSuggester
-  := lift_let <| fun _doc _goal _params lhs _rhs => do
-  let simp_ctx <- mkSimpContext (hasStar := true) (cfg := simp_cfg)
-  let lhs_result <- get_dsimp simp_ctx lhs
-  -- let rhs_result <- get_dsimp simp_ctx rhs
-  let lhss <- lhs_result.toArray.mapM fun (lhs', fmt) => do
-    if <- isDefEq lhs lhs' then return ({
-      hint := "Simplify: rfl"
-      new_lhs? := lhs'
-      proof? := some "rfl"
-      info? := some (.text "reflexivity")
-    } : Suggestion)
-    else return ({
-      hint := "Simplify LHS: dsimp"
-      new_lhs? := lhs'
-      info? := some <span className="font-code">{.text fmt.pretty}</span>
-      proof? := some s!"dsimp only [{fmt}]"
-    } : Suggestion)
-  -- let rhss := rhs_result.toArray.map fun (rhs', fmt) => ({
-  --   hint := "Simplify RHS: dsimp"
-  --   new_rhs? := rhs'
-  --   info? := some <span className="font-code">{.text fmt.pretty}</span>
-  --   proof? := some s!"dsimp only [{fmt}]"
-  -- } : Suggestion)
-  return lhss
-
-def get_simp (ctx : Simp.Context) (exp : Expr) : MetaM (Option (Expr × Format)) := do
+def get_simp (ctx : Simp.Context) (exp : Expr)
+    : MetaM (Option (Expr × TSyntax `tactic)) := do
   let (res, stats) <- Meta.simp exp ctx
   let exp' := res.expr
-  if exp == exp' then
-    return none
-  else
-    let md_ctx := MessageDataContext.mk (<- getEnv) (<- getMCtx) (<- getLCtx) {}
-    let thms <- stats.usedTheorems.toArray.mapM fun o => do
-      let md <- ppOrigin o
-      md.format md_ctx
-    let fmt := Format.joinSep thms.toList ", "
-    if thms.isEmpty then return none
-    return some (exp', fmt)
-
-@[suggest]
-def suggest_simp : CalcSuggester
-  := lift_let <| fun _doc _goal _params lhs _rhs => do
-  let no_star_lhs <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
-  let with_star_lhs <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
-  let lhss := (no_star_lhs.toArray ++ with_star_lhs.toArray).map fun (lhs', fmt) => {
-    hint := "Simplify LHS: simp"
-    new_lhs? := lhs'
-    info? := <span className="font-code">{.text fmt.pretty}</span>
-    proof? := s!"simp only [{fmt}]"
-  }
-  -- let no_star_rhs <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) rhs
-  -- let with_star_rhs <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) rhs
-  -- let rhss := (no_star_rhs.toArray ++ with_star_rhs.toArray).map fun (rhs', fmt) => {
-  --   hint := "Simplify RHS: simp"
-  --   new_rhs? := rhs'
-  --   info? := <span className="font-code">{.text fmt.pretty}</span>
-  --   proof? := s!"simp only [{fmt}]"
-  -- }
-  return lhss
-
-@[suggest]
-def suggest_trivial : CalcSuggester :=
-  lift_let <| fun goal _doc _params _lhs _rhs => do
-  let mv := goal.mvarId
-  let save <- Meta.saveState
-  let (mvs, _) <- runTactic mv (<- `(tactic| try trivial))
-  save.restore
-  match mvs with
-    | [] => return #[{
-      hint := "Trivial"
-      proof? := "trivial"
-    }]
-    | _ => return #[]
-
-@[suggest]
-def suggest_define : CalcSuggester :=
-  lift_let <| fun goal _doc _params lhs rhs => do
-  let mv := goal.mvarId
-  let lhs_stx <- PrettyPrinter.delab lhs
-  let rhs_stx <- PrettyPrinter.delab rhs
-  let tac <- `(tactic| define $rhs_stx := $lhs_stx)
-  let save <- Meta.saveState
-  let ctx <- getLCtx
-  let proof <- ContextInfo.ppSyntax goal.ctx.val ctx tac
-  let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
-  save.restore
-  match mvs with
-    | [] => return #[{
-        hint := "Define"
-        proof? := some (toString proof)
-        info? := <span className="font-code">
-          {<- expr_component rhs}
-          {sep}{.text ":="}{sep}
-          {<- expr_component lhs}
-        </span>
-      }]
-    | _ => return #[]
+  if exp == exp' then return none
+  let origins := stats.usedTheorems.toArray
+  if origins.isEmpty then return none
+  let mut names : List String := []
+  for o in origins do
+    match o with
+    | .decl n _ _  => names := names ++ [toString n]
+    | .fvar fv     => names := names ++ [toString (<- fv.getDecl).userName]
+    | .stx _ syn   =>
+      let n := syn.getId
+      unless n.isAnonymous do names := names ++ [toString n]
+    | .other _     => pure ()
+  if names.isEmpty then return none
+  return some (exp', <- strToTactic s!"simp only [{", ".intercalate names}]")
 
 def get_selected_exprs {Params : Type} [SelectInsertParamsClass Params]
   (params : Params) (goal_ty : Expr) : MetaM (Array Expr) := do
@@ -253,6 +141,139 @@ def find_substrings (s src : String) : List (String.Pos.Raw × String.Pos.Raw)
 private partial def unarrow (ty : Expr) : (List Expr × Expr) := match ty.arrow? with
   | some (a, b) => let (xs, r) := unarrow b; (a :: xs, r)
   | none => ([], ty)
+
+def all_suggestions : CalcSuggester := fun doc params goal lhs rhs => do
+  let env <- getEnv
+  let sugg_names := suggester_ext.getState env
+  let suggs <- sugg_names.foldlM (init := #[]) fun acc n => do
+    let some f_info := env.find? n | throwError "couldn't find suggester: {n}"
+    let f <- unsafe evalExpr CalcSuggester (f_info.type) (mkConst n)
+    let suggs <- f doc params goal lhs rhs
+    return (acc ++ suggs)
+  return suggs.toList.mergeSort.eraseDups.toArray
+
+@[suggest]
+def suggest_already_eq : CalcSuggester := fun _goal _doc _params lhs rhs => do
+  if <- withNewMCtxDepth (isDefEq lhs rhs) then
+    return #[{
+      hint := "Already equal"
+      intermediates := #[]
+      finalProof := none
+      precedence := 100
+      info? := Html.text "Remove this step, as it's not needed."
+    }]
+  else
+    return #[]
+
+@[suggest]
+def suggest_apply_hyp : CalcSuggester := lift_let <| fun goal _doc _params lhs _ => do
+  let mv := goal.mvarId
+  let lctx := (<- mv.getDecl).lctx |>.sanitizeNames.run' {options := (<- getOptions)}
+  let mut suggestions : Array SuggestionSpec := #[]
+  for i in lctx.decls do
+    let some d := i | continue
+    try
+      let r <- mv.rewrite lhs d.toExpr
+      let proof <- strToTactic s!"rw [{d.userName}]"
+      suggestions := suggestions.push {
+        hint := "Apply hypothesis"
+        info? := some
+          <span>
+            Using hypothesis:<br />{sep}
+            <strong className="goal-hyp">
+              {.text (toString f!"{d.userName}")}
+            </strong>
+            {sep}:{sep}
+            {<- expr_component d.type}
+          </span>
+        intermediates := #[(r.eNew, proof)]
+        finalProof := some (<- todo)
+        precedence := 70
+      }
+    catch | _ => pure ()
+  return suggestions
+
+@[suggest]
+def suggest_dsimp : CalcSuggester
+  := lift_let <| fun _doc _goal _params lhs _rhs => do
+  let simp_ctx <- mkSimpContext (hasStar := true) (cfg := simp_cfg)
+  let lhs_result <- get_dsimp simp_ctx lhs
+  let lhss <- lhs_result.mapM fun (lhs', tac) => do
+    if <- isDefEq lhs lhs' then
+      return {
+        hint := "Simplify LHS: rfl"
+        intermediates := #[(lhs', <- `(tactic| rfl))]
+        finalProof := (<- todo)
+        info? := some (.text "Trivially simplify by definition")
+        precedence := 80
+      }
+    else
+      return {
+        hint := "Simplify LHS: dsimp"
+        intermediates := #[(lhs', tac)]
+        finalProof := <- todo
+        info? := <- ppTactic tac
+        precedence := 50
+      }
+  return lhss.toArray
+
+@[suggest]
+def suggest_simp : CalcSuggester
+  := lift_let <| fun _doc _goal _params lhs _rhs => do
+  let no_star_lhs  <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
+  let with_star_lhs <- get_simp (<- mkSimpContext (hasStar := true)  (cfg := simp_cfg)) lhs
+  let lhss <- (no_star_lhs.toArray ++ with_star_lhs.toArray).mapM fun (lhs', tac) =>
+    return {
+      hint := "Simplify LHS: simp"
+      intermediates := #[(lhs', tac)]
+      finalProof := <- todo
+      info? := <- ppTactic tac
+      precedence := 49
+    }
+  return lhss
+
+@[suggest]
+def suggest_trivial : CalcSuggester :=
+  lift_let <| fun goal _doc _params _lhs _rhs => do
+  let mv := goal.mvarId
+  let save <- Meta.saveState
+  let (mvs, _) <- runTactic mv (<- `(tactic| try trivial))
+  save.restore
+  match mvs with
+    | [] => return #[{
+      hint := "Trivial"
+      intermediates := #[]
+      finalProof := some (<- `(tactic| trivial))
+      precedence := 100
+      info? := Html.text "Close this goal using the trivial tactic."
+    }]
+    | _ => return #[]
+
+@[suggest]
+def suggest_define : CalcSuggester :=
+  lift_let <| fun goal _doc _params lhs rhs => do
+  let mv := goal.mvarId
+  let lhs_stx <- PrettyPrinter.delab lhs
+  let rhs_stx <- PrettyPrinter.delab rhs
+  let tac <- `(tactic| define $rhs_stx := $lhs_stx)
+  let save <- Meta.saveState
+  let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
+  save.restore
+  match mvs with
+    | [] => return #[({
+        hint := "Define"
+        precedence := 70
+        intermediates := #[]
+        finalProof := some tac
+        info? := <div>
+          Give a (partial) definition of {<- expr_component (rhs.getAppFn)}:
+          <br />
+          <span className="font-code">
+            {<- expr_component rhs}{sep}{.text ":="}{sep}{<- expr_component lhs}
+          </span>
+        </div>
+      })]
+    | _ => return #[]
 
 @[suggest]
 def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => do
@@ -301,13 +322,18 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => d
         { range := .mk (src.leanPosToLspPos (src.toPosition s))
                        (src.leanPosToLspPos (src.toPosition e)),
           newText := s!"({hole_fill})" }
-      return #[{
+      return #[({
         hint := ""
+        intermediates := #[]
+        finalProof := none
+        precedence := 40
         info? := <span>
-          <span className="font-code">
-            {.text s!"define: {con_name} : "}
+          <span>
+            {.text s!"Add new constructor:"}<br />{sep}
+            <span className="font-code">{.text con_name} : </span>
             {<- expr_component con_ty},<br />
-            {.text s!"let {mv_name} := "}
+            {.text s!"Then, instantiate hole:"}<br />{sep}
+            <span className="font-code">{.text mv_name} := </span>
             {<- expr_component con_app}
             <br />
           </span>
@@ -319,31 +345,56 @@ def suggest_new_constructor : CalcSuggester := fun goal doc params _lhs rhs => d
           (.ofReplaceRange doc.meta insert_range insert_text (some select_range)
             |> with_extra hole_edits.toArray)
           #[<span style={json% { marginRight: "5px", fontWeight: "bold" }}>
-            {.text s!"[New {ty_name} constructor]"}</span>]
-      }]
+            {.text s!"[New constructor in '{ty_name}']"}</span>]
+      })]
   return #[]
 
 @[suggest]
-def factor_common_subexpr : CalcSuggester :=
+def suggest_factor_common_subexpr : CalcSuggester :=
   lift_let <| fun goal _doc params lhs rhs => do
     let selected <- get_selected_exprs params (<- goal.mvarId.getType)
     if selected.isEmpty then return #[]
-    let common := selected.filter fun e => e.occurs lhs && e.occurs rhs
-    common
-      -- |>.toList
-      -- |>.mergeSort (fun e1 e2 => e2.approxDepth < e1.approxDepth)
-      -- |>.eraseDupsBy (fun e1 e2 => e1.occurs e2 || e2.occurs e1)
-      -- |>.toArray
-      |>.mapM fun e => do
+    let (lhs', rhs') <- loop selected.toList lhs rhs
+    let rfl_tac  <- `(tactic| rfl)
+    let hole_tac <- todo
+    return match lhs == lhs', rhs == rhs' with
+    | true, true => #[]
+    | true, false => #[({
+        precedence := 200
+        info? := Html.text "Abstract selected sub-terms via let-bindings"
+        hint := s!"Factor sub-terms (RHS)"
+        intermediates := #[(rhs', rfl_tac)]
+        finalProof := some hole_tac
+      })]
+    | false, true => #[({
+        precedence := 200
+        info? := Html.text "Abstract selected sub-terms via let-bindings"
+        hint := s!"Factor sub-terms (LHS)"
+        intermediates := #[(lhs', rfl_tac)]
+        finalProof := some hole_tac
+      })]
+    | false, false => #[({
+        precedence := 201
+        info? := Html.text "Abstract sub-terms common to LHS and RHS via let-bindings"
+        hint := s!"Factor sub-terms"
+        intermediates := #[(lhs', rfl_tac), (rhs', hole_tac)]
+        finalProof := some rfl_tac
+      })]
+  where
+    abstract (e body : Expr) (name : Name) := do
       let t <- inferType e
-      let lhs' := lhs.replace fun e' => if e == e' then Expr.bvar 0 else none
-      let rhs' := rhs.replace fun e' => if e == e' then Expr.bvar 0 else none
-      return {
-        hint := s!"Factor common: '{<- ppExpr e}'"
-        new_lhs? := Expr.letE `u t e lhs' false
-        new_rhs? := Expr.letE `u t e rhs' false
-        proof? := "rfl"
-      }
+      let fv <- mkFreshFVarId
+      let body' := body.replace fun e' => if e == e' then Expr.fvar fv else none
+      if body == body' then return body
+      return Expr.letE name t e (body'.abstract #[.fvar fv]) false
+    loop (common : List Expr) (lhs rhs : Expr) : MetaM (Expr × Expr) := match common with
+      | [] => return (lhs, rhs)
+      | e :: es => do
+        let t <- inferType e
+        let name := (<- getLCtx).getUnusedName `u
+        let lhs' <- abstract e lhs name
+        let rhs' <- abstract e rhs name
+        withLetDecl name t e fun _ => loop es lhs' rhs'
 
 @[suggest]
 def suggest_cong : CalcSuggester :=
@@ -356,9 +407,9 @@ def suggest_cong : CalcSuggester :=
     return #[]
   where
     pairwise_eq := fun (l, r) => withNewMCtxDepth (isDefEq l r)
-    try_cong goal doc params _fn args : MetaM (Array Suggestion) := do
+    try_cong goal doc params _fn args : MetaM (Array SuggestionSpec) := do
       let (pre, (l, r) :: post) <- args.partitionM pairwise_eq
-        | do return #[] -- in this case, all args already equal...
+        | do return #[]
       if !(<- post.allM pairwise_eq) then return #[]
       let arg_idx := pre.length + 1
       let suggs <- all_suggestions goal doc params l r
@@ -370,30 +421,31 @@ def suggest_cong : CalcSuggester :=
               {.text s!"(By congruence over argument no. {arg_idx})"}
             </span>
           </span>
+        precedence := s.precedence - 1
       }
-
-private def get_selections (locs : Array GoalsLocation) : (Array Pos × Bool × Bool) :=
-  let subs := getGoalLocations locs
-  let sel_left := subs.any fun L => #[0, 1].isPrefixOf L.toArray
-  let sel_right := subs.any fun L => #[1].isPrefixOf L.toArray
-  (subs, sel_left, sel_right)
 
 @[suggest]
 def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs => do
   let (subs, sel_left, sel_right) := get_selections params.selectedLocations
   let mut goal_ty <- goal.mvarId.getType
   for pos in subs do
-    goal_ty <- insertMetaVar goal_ty pos
+    let mv_name <- getUnusedUserName (.str .anonymous "hole")
+    goal_ty <- replaceSubexpr (fun _ => mkFreshExprMVar none (userName := mv_name)) pos goal_ty
   let some (_, lhs', rhs') <- getCalcRelation? goal_ty
     | return #[]
   if !sel_left && !sel_right then
     return #[]
-  return #[{
+  let hole_tac <- todo
+  let intermediates :=
+    (if sel_left  then #[(lhs', hole_tac)] else #[]) ++
+    (if sel_right then #[(rhs', hole_tac)] else #[])
+  return #[({
     hint := "Rewrite"
-    new_lhs? := if sel_left then some lhs' else none
-    new_rhs? := if sel_right then some rhs' else none
-    info? := some (.text "some further proof / definition")
-  }]
+    intermediates := intermediates
+    finalProof := some hole_tac
+    info? := some (.text "Replace this subterm with a hole; fill this in manually afterwards.")
+    precedence := 250
+  })]
 
 @[suggest]
 def suggest_expand_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
@@ -403,20 +455,23 @@ def suggest_expand_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
     goal_ty <- replaceSubexpr whnf pos goal_ty
   let some (_, lhs', rhs') <- getCalcRelation? goal_ty
     | return #[]
-  let done_left := sel_left && lhs != lhs'
+  let done_left  := sel_left  && lhs != lhs'
   let done_right := sel_right && rhs != rhs'
   if !done_left && !done_right then
     return #[]
-  return #[{
+  let rfl_tac  <- `(tactic| rfl)
+  let hole_tac <- todo
+  let intermediates :=
+    (if done_left  then #[(lhs', rfl_tac)]  else #[]) ++
+    (if done_right then #[(rhs', hole_tac)] else #[])
+  return #[({
+    precedence := 200
     hint := "Expand terms"
-    new_lhs? := if done_left then some lhs' else none
-    new_rhs? := if done_right then some rhs' else none
-    info? := <span className="font-code">rfl</span>
-    proof? := "rfl"
-  }]
+    intermediates := intermediates
+    finalProof := some hole_tac
+    info? := some (.text "Expand definitions to weak-head normal form, by definition.")
+  })]
 
--- Try to fold `sub` into `name ?args` by unifying via isDefEq.
--- Returns the instantiated application if all args are determined.
 private def tryFoldWith (name : Name) (sub : Expr) : MetaM (Option Expr) := do
   let some ci := (<- getEnv).find? name | return none
   unless ci.hasValue do return none
@@ -435,10 +490,6 @@ private def tryFoldWith (name : Name) (sub : Expr) : MetaM (Option Expr) := do
   catch _ => save.restore
   return none
 
--- Opposite of suggest_expand_subexpr: for each selected subterm, look for a
--- definition in the current file whose unfolding is definitionally equal to it,
--- and suggest replacing the subterm with that definition applied to arguments.
--- E.g. turns (∃ n : ℤ, e ⇓ ↑n ∧ ↑n ∈ Ty.Int) into ⊨ e : .Int
 @[suggest]
 def suggest_fold_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
   let (subs, sel_left, sel_right) := get_selections params.selectedLocations
@@ -447,7 +498,9 @@ def suggest_fold_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
   let candidates : List Name := env.constants.map₂.toList.filterMap fun (name, ci) =>
     if ci.hasValue && !name.isAnonymous then some name else none
   if candidates.isEmpty then return #[]
-  let mut suggestions : Array Suggestion := #[]
+  let rfl_tac  <- `(tactic| rfl)
+  let hole_tac <- todo
+  let mut suggestions : Array SuggestionSpec := #[]
   for candName in candidates do
     let mut goal_ty <- goal.mvarId.getType
     let mut anyFolded := false
@@ -458,17 +511,20 @@ def suggest_fold_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
         anyFolded := true
     unless anyFolded do continue
     let some (_, lhs', rhs') <- getCalcRelation? goal_ty | continue
-    let done_left := sel_left && lhs != lhs'
+    let done_left  := sel_left  && lhs != lhs'
     let done_right := sel_right && rhs != rhs'
     unless done_left || done_right do continue
     let name_s := toString (<- ppExpr (<- mkConstWithFreshMVarLevels candName))
-    suggestions := suggestions.push {
+    let intermediates :=
+      (if done_left  then #[(lhs', rfl_tac)]  else #[]) ++
+      (if done_right then #[(rhs', hole_tac)] else #[])
+    suggestions := suggestions.push ({
       hint := "Fold"
-      new_lhs? := if done_left then some lhs' else none
-      new_rhs? := if done_right then some rhs' else none
+      precedence := 220
+      intermediates := intermediates
+      finalProof := some rfl_tac
       info? := some <span className="font-code">{.text name_s}</span>
-      proof? := "rfl"
-    }
+    })
   return suggestions
 
 end Tactic.Calculation

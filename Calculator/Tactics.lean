@@ -202,12 +202,12 @@ Provides a (partial) definition of a function being calculated.
   as we are okay with the resulting function being partial.
 -/
 elab (name := defineTactic)
-  "define" only:("only")? part:("partial")? p:term " := " to_term:term : tactic
+  "define" only:("only")? _part:("partial")? p:term " := " to_term:term : tactic
   => do
   let main_goal <- Tactic.withMainContext Tactic.getMainGoal
   let mctx <- Tactic.withMainContext getMCtx
   let is_only := only.isSome
-  let is_partial := part.isSome
+  let is_partial := true -- part.isSome
   match p with
   | `($f:ident) => do
     let (some mv) := mctx.findUserName? f.getId
