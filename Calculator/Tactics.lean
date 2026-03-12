@@ -127,6 +127,44 @@ def desugar_clause_def
   let body_fn <- elabTerm body_node_rw (some clause_ty)
   return body_fn
 
+/-- For each calc fvar (`let name := ?mv` in the main goal's lctx) that appears in `e`,
+    add a corresponding let-binding to `clauseMv`'s local context.
+    Returns the updated mvar and `e` with the outer fvars replaced by the new local ones.
+    This keeps field names (like `ins`) visible by name in sub-goals rather than unfolding
+    to the raw (possibly partially-assigned) mvar. -/
+def liftCalcFvarsIntoClause (clauseMv : MVarId) (e : Expr)
+    : Tactic.TacticM (MVarId × Expr) :=
+  Tactic.withMainContext do
+    let lctx <- getLCtx
+    let clauseDecl <- clauseMv.getDecl
+    let calcBindings := lctx.decls.toList.filterMap fun d? => do
+      let d <- d?
+      guard d.isLet
+      let val <- d.value?
+      guard val.isMVar
+      guard (e.containsFVar d.fvarId)
+      -- Skip fvars already in the clause mvar's lctx — they're valid as-is.
+      guard (! clauseDecl.lctx.contains d.fvarId)
+      some d
+    if calcBindings.isEmpty then return (clauseMv, e)
+    let mut mv := clauseMv
+    let mut oldFVars : Array Expr := #[]
+    let mut newFVars : Array Expr := #[]
+    for d in calcBindings do
+      let some val := d.value? | continue
+      -- Extend the clause mvar's local context directly. We avoid `define` + `intro1P`
+      -- because `whnfD` reduces `let x := v; T` to `T` when x ∉ T, causing `intro1P`
+      -- to introduce the wrong thing (the first ∀ of T instead of the let-binding).
+      let decl <- mv.getDecl
+      let newFVarId <- mkFreshFVarId
+      let newLctx := decl.lctx.mkLetDecl newFVarId d.userName d.type val false
+      let newMv <- mkFreshExprMVarAt newLctx decl.localInstances decl.type decl.kind (← mv.getTag)
+      mv.assign newMv
+      mv := newMv.mvarId!
+      oldFVars := oldFVars.push (.fvar d.fvarId)
+      newFVars := newFVars.push (.fvar newFVarId)
+    return (mv, e.replaceFVars oldFVars newFVars)
+
 partial def define_mv (bind_name : Name) (to_expr : Expr) : Tactic.TacticM Unit :=
   go bind_name
 where
@@ -142,7 +180,8 @@ where
           -- Redirect to the chained else-mvar introduced by 'define only'
           go (Name.str name "else")
         else
-          mv.assignIfDefEq to_expr
+          let (mv', to_expr') <- liftCalcFvarsIntoClause mv to_expr
+          mv'.withContext do mv'.assignIfDefEq to_expr'
 
 def count_implicit_args (ty : Expr) : Nat := match ty with
   | .forallE _ _ b .implicit => 1 + count_implicit_args b
@@ -186,6 +225,38 @@ def inhabit_mv (mv : MVarId) : MetaM Bool := do
   else
     return false
 
+/-- Parse `rest` args into `(binder name, optional pattern)` pairs. -/
+def parseRestArgs (rest : TSyntaxArray `term)
+    : Tactic.TacticM (List (Name × Option (TSyntax `term))) :=
+  rest.toList.mapM fun s => do
+    match s.raw with
+    | `($i:ident) => pure (i.getId, none)
+    | _ => return (← mkFreshUserName (.mkSimple "arg"), some ⟨s.raw⟩)
+
+/-- Wrap `body` in `match` expressions for each pattern arg in `restInfo`.
+    With `is_partial`, non-matching arms become `?holeId` (first pattern arg)
+    or `don't care` (subsequent ones). -/
+def wrapBodyInMatches
+    (restInfo : List (Name × Option (TSyntax `term)))
+    (is_partial : Bool)
+    (firstPatName? : Option Name)
+    (holeId : Ident)
+    (body : TSyntax `term)
+    : Tactic.TacticM (TSyntax `term) :=
+  restInfo.foldrM (fun (name, pat?) acc => do
+    match pat? with
+    | none => pure acc
+    | some pat =>
+      let nameId : Ident := mkIdent name
+      if is_partial then
+        let elseArm : TSyntax `term <-
+          if firstPatName? == some name then `(?$holeId:ident)
+          else `(don't care)
+        `(match $nameId:ident with | $pat:term => $acc | _ => $elseArm)
+      else
+        `(match $nameId:ident with | $pat:term => $acc))
+  body
+
 /--
 Provides a (partial) definition of a function being calculated.
 
@@ -198,16 +269,16 @@ Provides a (partial) definition of a function being calculated.
 * `define only ...` does the same thing, but doesn't automatically close the current
   goal.
 
-* `define partial ...` allows further pattern matching on subsequent arguments, as long
-  as we are okay with the resulting function being partial.
+* `define total ...` don't allow partial pattern matching on subsequent (non-recursive)
+  arguments.
 -/
 elab (name := defineTactic)
-  "define" only:("only")? _part:("partial")? p:term " := " to_term:term : tactic
+  "define" only:("only")? tot:("total")? p:term " := " to_term:term : tactic
   => do
   let main_goal <- Tactic.withMainContext Tactic.getMainGoal
   let mctx <- Tactic.withMainContext getMCtx
   let is_only := only.isSome
-  let is_partial := true -- part.isSome
+  let is_partial := !tot.isSome
   match p with
   | `($f:ident) => do
     let (some mv) := mctx.findUserName? f.getId
@@ -218,38 +289,24 @@ elab (name := defineTactic)
   | `($f:ident $pat:term $rest*) => do
     let (some search_fn_mv) := mctx.findUserName? f.getId
       | throwErrorAt f "the name {f.getId} is undefined"
-    let search_ty <- search_fn_mv.getType''
-    let some (inp_ty, _) := search_ty.arrow?
+    let some (inp_ty, _) := (<- search_fn_mv.getType'').arrow?
       | throwErrorAt f "unexpected argument in definition of non-function {f}"
-    -- expand out the constructor argument's pattern to figure out the name
-    -- of the constructor and its (explicit) arguments
+    -- Expand the constructor pattern to get constructor name and arg names.
     let pat <- liftMacroM <| expandMacros pat
     let (con_stx, con_arg_names) <- collect_ctor_pattern pat
     let con <- elabTerm con_stx (some inp_ty)
-    let con_ty <- inferType con
-    let num_implicit := count_implicit_args con_ty
-    let con_arg_names := con_arg_names.drop num_implicit
     let (con_fn, _) := con.getAppFnArgs
+    let con_arg_names := con_arg_names.drop (count_implicit_args (<- inferType con))
     let clause_name <- match con_fn with
     | .str _ con_name => pure (Name.str f.getId con_name)
     | _ => throwErrorAt pat "expected a constructor, but got {con_fn}"
-    let mctx <- getMCtx
-    let some clause_expr := mctx.findUserName? clause_name |> (·.map (Expr.mvar ·))
+    let some clause_expr := (<- getMCtx).findUserName? clause_name |> (·.map (Expr.mvar ·))
       | throwErrorAt f "unknown defining clause for {f}, for pattern: {pat}"
-    -- Collect (name, optional_pattern) for each rest arg.
-    -- Plain idents become a binder name. Any other syntax becomes a
-    -- fresh binder name + a pattern that wraps to_term in a match.
-    let restInfo <- rest.toList.mapM fun s => do
-      match s.raw with
-      | `($i:ident) => pure (i.getId, (none : Option (TSyntax `term)))
-      | _ => do
-        let fresh <- mkFreshUserName (.mkSimple "arg")
-        pure (fresh, some ⟨s.raw⟩)
+    let restInfo <- parseRestArgs rest
     let rest_names := restInfo.map (·.fst)
     -- Whether any rest arg uses a pattern (vs plain ident).
     let hasPatternArgs := restInfo.any (·.snd.isSome)
-    -- Name of the first (leftmost/outermost) pattern arg — its else arm gets a
-    -- named hole when using 'define only', so a subsequent 'define' can fill it.
+    -- First pattern arg's else arm gets a named hole; subsequent ones use `don't care`.
     let firstPatName? := restInfo.findSome? fun (n, p?) => if p?.isSome then some n else none
     let else_clause_name := Name.str clause_name "else"
     -- Use a fresh uniquely-named hole for the outermost else arm in 'define only'.
@@ -258,21 +315,8 @@ elab (name := defineTactic)
         then mkFreshUserName `else
         else pure .anonymous
     let holeId : Ident := mkIdent hole_user_name
-    -- Wrap to_term in match expressions for all pattern args (right fold,
-    -- so the first pattern arg becomes the outermost match).
-    let to_term' <- restInfo.foldrM (fun (name, pat?) acc => do
-      match pat? with
-      | none => pure acc
-      | some pat =>
-        let nameId : Ident := mkIdent name
-        if is_partial then
-          let elseArm : TSyntax `term <-
-            if firstPatName? == some name then `(?$holeId:ident)
-            else `(don't care)
-          `(match $nameId:ident with | $pat:term => $acc | _ => $elseArm)
-        else
-          `(match $nameId:ident with | $pat:term => $acc))
-      to_term
+    -- Wrap to_term in match expressions for all pattern args.
+    let to_term' <- wrapBodyInMatches restInfo is_partial firstPatName? holeId to_term
     -- Capture outer lctx (before lambda binders are added by desugar_clause_def).
     let outer_lctx <- Tactic.withMainContext getLCtx
     -- construct a new function, 'fn', to define as the body
@@ -351,15 +395,15 @@ def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
   return fv
 
 def calc_intro_other (as_name : Name) (field_ty : Expr)
-  : Tactic.TacticM Expr := do
-  let field_body <- mkFreshExprMVar (some field_ty)
+  : Tactic.TacticM (Expr × FVarId) := do
+  let field_body <- Tactic.withMainContext <| mkFreshExprMVar (some field_ty)
   field_body.mvarId!.setUserName as_name
-  let _ <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
+  let fv <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
   Tactic.appendGoals [field_body.mvarId!]
-  return field_body
+  return (field_body, fv)
 
 def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name : Name := field_name)
-    : Tactic.TacticM Expr
+    : Tactic.TacticM (Expr × FVarId)
   := do
   let some (_, field) := fields.find? fun (n, _) => n = field_name
     | throwUnknownNameWithSuggestions field_name (extraMsg :=
@@ -374,13 +418,13 @@ Typically used in calculations, for instance:
 
   ```lean
   calculate comp
-  refine comp => apply Exp.rec
+  given_by comp => apply Exp.rec
   ```
 
 `calculate comp` introduces a metavar named `comp`, which is then refined
 into a recursive definition with a new metavar for each constructor's case.
 -/
-elab "refine " vs:ident,* " => " tac:tactic : tactic => Tactic.withMainContext do
+elab "given_by " vs:ident,* " => " tac:tacticSeq : tactic => Tactic.withMainContext do
   let ids <- vs.getElems.mapM fun v => do
     let id := v.getId
     if (<- getMCtx).findUserName? id |>.isNone then
@@ -421,28 +465,28 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   if vs.getElems.size == 0 then
     logWarning f!"use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
   -- for each ident 'v' listed:
-  let vals <- vs.getElems.mapM fun s => do
+  let vals <- vs.getElems.mapM fun s => withRef s do
     match s with
     | `(calc_name| $v:ident) =>
       let field_name := v.getId
       let val <- calc_intro_for field_name spec_fields
-      return (field_name, field_name, val)
+      return (field_name, field_name, val, s)
     | `(calc_name| $v:ident as $r:ident) =>
       let field_name := v.getId
       let as_name := r.getId
       let val <- calc_intro_for field_name spec_fields (as_name := as_name)
-      return (field_name, as_name, val)
+      return (field_name, as_name, val, s)
     | _ => throwUnsupportedSyntax
   -- split the main goal into its constructor fields, and set each one to the corresponding
   -- recursor binding from above
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
   Tactic.pushGoals field_mvs
-  for (field_name, as_name, val) in vals do
-    for field_mv in field_mvs do
-      if (<- field_mv.getTag) == field_name then
-        field_mv.assign val
-        field_mv.setUserName as_name
+  for (field_name, as_name, (mv_val, _fv), stx) in vals do
+    let some field_mv <- field_mvs.findM? fun u => u.getTag <&> (· == field_name)
+      | throwErrorAt stx "bug: unknown field name: {field_name}"
+    field_mv.assign mv_val
+    field_mv.setUserName as_name
 
 @[inherit_doc calculateTactic]
 elab (name := calculateGoal) "calculate" "⊢" "as" r:ident : tactic => Tactic.withMainContext do

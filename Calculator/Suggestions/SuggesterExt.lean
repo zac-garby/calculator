@@ -30,6 +30,8 @@ structure SuggestionSpec where
   custom_button? : Option ProofWidgets.Html := none
   /-- Higher precedence is shown first -/
   precedence : Int := 0
+  /-- If false, then we don't allow this under congruence. -/
+  canCong : Bool := true
 
 instance : BEq SuggestionSpec where
   beq s1 s2 :=

@@ -2,6 +2,7 @@ import Mathlib.Tactic.Common
 
 namespace Calculator.Syntax.Implication
 
+@[simp]
 def impR (a b : Prop) : Prop := b -> a
 
 infix:25 "

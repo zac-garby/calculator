@@ -219,9 +219,9 @@ def suggest_dsimp : CalcSuggester
 
 @[suggest]
 def suggest_simp : CalcSuggester
-  := lift_let <| fun _doc _goal _params lhs _rhs => do
+  := lift_let <| fun _goal _doc _params lhs _rhs => do
   let no_star_lhs  <- get_simp (<- mkSimpContext (hasStar := false) (cfg := simp_cfg)) lhs
-  let with_star_lhs <- get_simp (<- mkSimpContext (hasStar := true)  (cfg := simp_cfg)) lhs
+  let with_star_lhs <- get_simp (<- mkSimpContext (hasStar := true) (cfg := simp_cfg)) lhs
   let lhss <- (no_star_lhs.toArray ++ with_star_lhs.toArray).mapM fun (lhs', tac) =>
     return {
       hint := "Simplify LHS: simp"
@@ -231,6 +231,23 @@ def suggest_simp : CalcSuggester
       precedence := 49
     }
   return lhss
+
+@[suggest]
+def suggest_simp_all : CalcSuggester
+  := lift_let <| fun goal _doc _params _lhs _rhs => do
+  let mv := goal.mvarId
+  let save <- Meta.saveState
+  let (mvs, _) <- runTactic mv (<- `(tactic| try simp_all))
+  save.restore
+  match mvs with
+    | [] => return #[{
+      hint := "Solve by simplification"
+      intermediates := #[]
+      finalProof := some (<- `(tactic| simp_all?))
+      precedence := 48
+      info? := Html.text "Using simp_all, we can make the LHS into the RHS."
+    }]
+    | _ => return #[]
 
 @[suggest]
 def suggest_trivial : CalcSuggester :=
@@ -365,6 +382,7 @@ def suggest_factor_common_subexpr : CalcSuggester :=
         hint := s!"Factor sub-terms (RHS)"
         intermediates := #[(rhs', rfl_tac)]
         finalProof := some hole_tac
+        canCong := false
       })]
     | false, true => #[({
         precedence := 200
@@ -372,6 +390,7 @@ def suggest_factor_common_subexpr : CalcSuggester :=
         hint := s!"Factor sub-terms (LHS)"
         intermediates := #[(lhs', rfl_tac)]
         finalProof := some hole_tac
+        canCong := false
       })]
     | false, false => #[({
         precedence := 201
@@ -379,6 +398,7 @@ def suggest_factor_common_subexpr : CalcSuggester :=
         hint := s!"Factor sub-terms"
         intermediates := #[(lhs', rfl_tac), (rhs', hole_tac)]
         finalProof := some rfl_tac
+        canCong := false
       })]
   where
     abstract (e body : Expr) (name : Name) := do
@@ -413,7 +433,7 @@ def suggest_cong : CalcSuggester :=
       if !(<- post.allM pairwise_eq) then return #[]
       let arg_idx := pre.length + 1
       let suggs <- all_suggestions goal doc params l r
-      pure <| suggs.map fun s => { s with
+      pure <| suggs.filter (·.canCong) |>.map fun s => { s with
         info? := s.info?.map fun info =>
           <span>
             {info}<br />
@@ -426,6 +446,7 @@ def suggest_cong : CalcSuggester :=
 
 @[suggest]
 def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs => do
+  goal.mvarId.withContext do
   let (subs, sel_left, sel_right) := get_selections params.selectedLocations
   let mut goal_ty <- goal.mvarId.getType
   for pos in subs do
@@ -445,6 +466,7 @@ def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs =>
     finalProof := some hole_tac
     info? := some (.text "Replace this subterm with a hole; fill this in manually afterwards.")
     precedence := 250
+    canCong := false
   })]
 
 @[suggest]
@@ -470,6 +492,7 @@ def suggest_expand_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
     intermediates := intermediates
     finalProof := some hole_tac
     info? := some (.text "Expand definitions to weak-head normal form, by definition.")
+    canCong := false
   })]
 
 private def tryFoldWith (name : Name) (sub : Expr) : MetaM (Option Expr) := do
@@ -524,7 +547,160 @@ def suggest_fold_subexpr : CalcSuggester := fun goal _doc params lhs rhs => do
       intermediates := intermediates
       finalProof := some rfl_tac
       info? := some <span className="font-code">{.text name_s}</span>
+      canCong := false
     })
   return suggestions
+
+/-- Like `replaceSubexpr` but the replacement callback may return multiple results.
+Each result is re-abstracted over any binders traversed, exactly as `replaceSubexpr` does
+for a single result. This means `replace` may safely reference free variables introduced
+by enclosing binders (e.g. the `v` from `∃ v, ...`). -/
+private def replaceSubexprMulti
+    (replace : Expr → MetaM (List Expr)) (p : SubExpr.Pos) (root : Expr) : MetaM (List Expr) :=
+  aux replace p.toArray.toList root
+where
+  coord (g : Expr → MetaM (List Expr)) (n : Nat) (e : Expr) : MetaM (List Expr) := do
+    match n, e with
+    | 0, .app f a          => return (← g f).map (e.updateApp! · a)
+    | 1, .app f a          => return (← g a).map (e.updateApp! f ·)
+    | 0, .lam _ y b _      => return (← g y).map (e.updateLambdaE! · b)
+    | 1, .lam n y b c      => withLocalDecl n c y fun x => do
+        (← g (b.instantiateRev #[x])).mapM (mkLambdaFVars #[x] ·)
+    | 0, .forallE _ y b _  => return (← g y).map (e.updateForallE! · b)
+    | 1, .forallE n y b c  => withLocalDecl n c y fun x => do
+        (← g (b.instantiateRev #[x])).mapM (mkForallFVars #[x] ·)
+    | 0, .letE _ y a b _   => return (← g y).map (e.updateLetE! · a b)
+    | 1, .letE _ y a b _   => return (← g a).map (e.updateLetE! y · b)
+    | 2, .letE n y a b _   => withLetDecl n y a fun x => do
+        (← g (b.instantiate1 x)).mapM (mkLetFVars #[x] ·)
+    | 0, .proj _ _ b       => return (← g b).map e.updateProj!
+    | n, .mdata _ a        => return (← coord g n a).map e.updateMData!
+    | 3, _                 => throwError "Lensing on types is not supported"
+    | c, e                 => throwError "Invalid coordinate {c} for {e}"
+  aux (g : Expr → MetaM (List Expr)) : List Nat → Expr → MetaM (List Expr)
+    | [],            e => g e
+    | head :: tail, e => coord (aux g tail) head e
+
+@[suggest]
+def suggest_restructuring : CalcSuggester := fun goal _doc _params _lhs _rhs => do
+  let mv := goal.mvarId
+  let save <- Meta.saveState
+  let (mvs, _) <- runTactic mv (<- `(tactic| try restructuring))
+  save.restore
+  match mvs with
+    | [] => return #[{
+      hint := "Restructure"
+      intermediates := #[]
+      finalProof := some (<- `(tactic| restructuring))
+      precedence := 100
+      info? := Html.text "Close this goal by general destructuring and constructing."
+    }]
+    | _ => return #[]
+
+@[suggest]
+def suggest_constructor_case : CalcSuggester := fun goal _doc params lhs rhs => do
+  let goal_ty <- goal.mvarId.getType
+  let (poss, _sel_left, _sel_right) := get_selections params.selectedLocations
+  let some _ <- getCalcRelation? goal_ty | return #[]
+  if poss.isEmpty then return #[]
+  -- Expand non-deterministically: each position may yield multiple replacement goal types
+  let mut goal_tys : Array Expr := #[goal_ty]
+  for pos in poss do
+    let mut new_goal_tys : Array Expr := #[]
+    for gt in goal_tys do
+      let results <- replaceSubexprMulti (fun sub => (tryCtors sub).force) pos gt
+      new_goal_tys := new_goal_tys ++ results.toArray
+    goal_tys := new_goal_tys
+  if goal_tys.isEmpty then return #[]
+  let hole_tac <- todo
+  let rst_tac <- `(tactic| restructuring)
+  let mut suggs : Array SuggestionSpec := #[]
+  for gt in goal_tys do
+    let some (_, lhs', rhs') <- getCalcRelation? gt | continue
+    let changed_lhs := lhs' != lhs
+    let changed_rhs := rhs' != rhs
+    unless changed_lhs || changed_rhs do continue
+    let intermediates :=
+      (if changed_lhs then #[(lhs', rst_tac)] else #[]) ++
+      (if changed_rhs then #[(rhs', rst_tac)] else #[])
+    suggs := suggs.push {
+      hint := "Constructor case"
+      precedence := 150
+      intermediates := intermediates
+      finalProof := some hole_tac
+      info? := some (.text "Expand by inductive constructor")
+      canCong := false
+    }
+  return suggs
+  where
+    buildConj : List Expr → Expr
+      | []      => mkConst ``True
+      | [p]     => p
+      | p :: ps => ps.foldl (fun acc q => mkApp2 (mkConst ``And) acc q) p
+    tryCtors (e : Expr) : MLList MetaM Expr := do
+      let e_whnf <- whnf e
+      let .const indName _ := e_whnf.getAppFn | failure
+      let env <- getEnv
+      let some (.inductInfo indInfo) := env.find? indName | failure
+      let ctorName <- MLList.ofList indInfo.ctors
+      let some result <- tryCtor e ctorName | failure
+      return result
+    tryCtor (e : Expr) (ctorName : Name) : MetaM (Option Expr) := do
+      let env <- getEnv
+      let some ctorCi := env.find? ctorName | return none
+      let levels <- ctorCi.levelParams.mapM fun _ => mkFreshLevelMVar
+      let ctorTy := ctorCi.type.instantiateLevelParams ctorCi.levelParams levels
+      let (argMVars, _, resultTy) <- forallMetaTelescopeReducing ctorTy
+      -- Check that the inductive head matches
+      let e_whnf <- whnf e
+      let r_whnf <- whnf resultTy
+      unless <- isDefEq e_whnf.getAppFn r_whnf.getAppFn do return none
+      let e_args := e_whnf.getAppArgs
+      let r_args := r_whnf.getAppArgs
+      unless e_args.size == r_args.size do return none
+      -- Match index args pairwise; fall back to an equality constraint on failure
+      let mut extraEqs : Array Expr := #[]
+      for (eArg, rArg) in e_args.zip r_args do
+        let saved <- Meta.saveState
+        if <- isDefEq rArg eArg then
+          pure ()
+        else
+          saved.restore
+          let rArgInst <- instantiateMVars rArg
+          extraEqs := extraEqs.push (<- mkEq eArg rArgInst)
+      -- Collect Prop-typed premise types (after instantiation)
+      let mut premiseTypes : Array Expr := #[]
+      for mv in argMVars do
+        let ty <- inferType mv
+        if <- isProp ty then
+          premiseTypes := premiseTypes.push (<- instantiateMVars ty)
+      premiseTypes := premiseTypes ++ extraEqs
+      if premiseTypes.isEmpty then return none
+      -- Collect uninstantiated data (non-Prop) mvars to existentially quantify
+      let mut dataMVarIds : Array (MVarId × Expr) := #[]
+      let mut seen : Std.HashSet MVarId := {}
+      for mv in argMVars do
+        let inst <- instantiateMVars mv
+        if let .mvar mvId := inst then
+          unless seen.contains mvId do
+            seen := seen.insert mvId
+            let ty <- instantiateMVars (<- inferType mv)
+            unless <- isProp ty do
+              dataMVarIds := dataMVarIds.push (mvId, ty)
+      -- Build the conjunction of premises, then wrap in ∃ for each data mvar
+      let mut conj := buildConj premiseTypes.toList
+      for (mvId, ty) in dataMVarIds.reverse do
+        -- Use a phantom FVar as a placeholder for this mvar
+        let fvId : FVarId := { name := <- mkFreshId }
+        let replFn : Expr → Option Expr := fun
+          | .mvar id => if id == mvId then some (.fvar fvId) else none
+          | _        => none
+        conj := conj.replace replFn
+        let ty' := ty.replace replFn
+        let bodyAbs := conj.abstract #[.fvar fvId]
+        let lvl <- getLevel ty'
+        let mvDecl <- mvId.getDecl
+        conj := mkApp2 (mkConst ``Exists [lvl]) ty' (.lam mvDecl.userName ty' bodyAbs .default)
+      return some conj
 
 end Tactic.Calculation

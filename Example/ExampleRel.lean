@@ -106,23 +106,36 @@ def semTy.val : Σ' (p : Prop), p -> ⊨ v : t := by
     _ <- v ∈ t
       := by restructuring
 
+set_option pp.funBinderTypes true
+
 def semTy.add : Σ' (p : Prop), p -> ⊨ e + e' : t := by
   calculate fst as premise
   change _ <- _
   calc
     ⊨ e + e' : t
-    _ <- ∃ v, e + e' ⇓ v ∧ v ∈ t
+    _ = ∃ v, e + e' ⇓ v ∧ v ∈ t
       := by rfl
-    _ <- ∃ (v : Val) (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
-      := by restructuring
-    _ <- ∃ (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
-      := by restructuring
-    _ <- ∃ (n n' : Int), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
-      := by restructuring
-    _ <- (∃ (n : Int), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : Int), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
-      := by restructuring
-    _ <- ⊨ e : .Int ∧ ⊨ e' : .Int ∧ t = .Int
-      := by restructuring
+    _ <- ∃ (v : Val), (∃ (n : Int), ∃ (n' : Int),
+          (e ⇓ ↑n ∧ e' ⇓ ↑n') ∧ v = ↑(n + n')) ∧ v ∈ t
+        := by restructuring
+    _ = ∃ (n : Int), ∃ (n' : Int), (e ⇓ ↑n ∧ e' ⇓ ↑n') ∧ ↑(n + n') ∈ t
+        := by simp_all only [↓existsAndEq, and_true]
+    _ <- ∃ (n : Int),
+           ∃ (n' : Int),
+             (e ⇓ ↑n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ ↑(n + n') ∈ t
+        := by restructuring
+    _ <- ⊨ e : Ty.Int ∧ ⊨ e' : Ty.Int ∧ t = Ty.Int
+        := by restructuring
+    -- _ <- ∃ (v : Val) (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ v = n + n' ∧ v ∈ t
+    --   := by restructuring
+    -- _ <- ∃ (n n' : Int), e ⇓ n ∧ e' ⇓ n' ∧ ↑(n + n') ∈ t
+    --   := by restructuring
+    -- _ <- ∃ (n n' : Int), e ⇓ n ∧ ↑n ∈ Ty.Int ∧ e' ⇓ n' ∧ ↑n' ∈ Ty.Int ∧ t = .Int
+    --   := by restructuring
+    -- _ <- (∃ (n : Int), e ⇓ ↑n ∧ ↑n ∈ Ty.Int) ∧ (∃ (n' : Int), e' ⇓ ↑n' ∧ ↑n' ∈ Ty.Int) ∧ t = .Int
+    --   := by restructuring
+    -- _ <- ⊨ e : .Int ∧ ⊨ e' : .Int ∧ t = .Int
+    --   := by restructuring
 
 def semTy.if_t : Σ' (p : Prop), p -> ⊨ if_ e then e₁ else e₂ : t := by
   calculate fst as premise
