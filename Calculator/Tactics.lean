@@ -1,4 +1,5 @@
 import Mathlib.Tactic.Common
+import Mathlib.Util.CompileInductive
 
 namespace Tactic.Calculation
 
@@ -14,6 +15,10 @@ macro "don't" "care" : term => `(panic! "found out the hard way that we do actua
 elab "todo" : tactic => return ()
 elab "todo" "[" term "]" : tactic => return ()
 def no_proof := "todo"
+
+def calc_name (name : Name) : Name
+  := name
+  where pre := Name.str .anonymous "ℂ"
 
 def match_struct_fields (goal_type : Expr)
   : MetaM (Array Expr × Array (Name × Expr)) := do
@@ -396,8 +401,9 @@ def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
 
 def calc_intro_other (as_name : Name) (field_ty : Expr)
   : Tactic.TacticM (Expr × FVarId) := do
-  let field_body <- Tactic.withMainContext <| mkFreshExprMVar (some field_ty)
-  field_body.mvarId!.setUserName as_name
+  let field_body <- Tactic.withMainContext do
+    mkFreshExprMVar (some field_ty) (kind := .syntheticOpaque)
+  field_body.mvarId!.setUserName (calc_name as_name)
   let fv <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
   Tactic.appendGoals [field_body.mvarId!]
   return (field_body, fv)
@@ -412,34 +418,91 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
   calc_intro_other as_name field_ty
 
 /--
-Refine some metavariables by applying a tactic.
+Refine a metavariable by applying a tactic.
 
 Typically used in calculations, for instance:
 
   ```lean
   calculate comp
-  given_by comp => apply Exp.rec
+  give comp => apply Exp.rec
   ```
 
 `calculate comp` introduces a metavar named `comp`, which is then refined
 into a recursive definition with a new metavar for each constructor's case.
 -/
-elab "given_by " vs:ident,* " => " tac:tacticSeq : tactic => Tactic.withMainContext do
-  let ids <- vs.getElems.mapM fun v => do
-    let id := v.getId
-    if (<- getMCtx).findUserName? id |>.isNone then
-      throwErrorAt v "unknown goal called '{id}'"
-    pure id
+private def elabGive
+  (v : TSyntax `ident) (as : TSyntaxArray `ident)
+  (tac : TSyntax `Lean.Parser.Tactic.tacticSeq)
+  : Tactic.TacticM Unit := Tactic.withMainContext do
+  let id := calc_name v.getId
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? id
+    | throwErrorAt v "unknown goal called '{id}'"
+  let goals <- Tactic.getGoals
+  if !(<- goals.anyM (fun goal => do let t <- goal.getTag; return t = id)) then
+    Tactic.appendGoals [mv]
   let goals <- Tactic.getGoals
   let goals' <- goals.flatMapM fun goal => do
     let decl <- goal.getDecl
-    if ids.elem decl.userName then
-      Tactic.evalTacticAt tac goal
+    if id = decl.userName then
+      let res <- Tactic.evalTacticAt tac goal
+      let ids := as.toList.map (·.getId)
+      for (i, r) in ids.zip res do
+        r.setUserName i
+      pure [goal] -- was pure res, but we don't necessarily want it a goal
     else
       pure [goal]
   Tactic.setGoals goals'
-  for v in vs.getElems do
-    Tactic.evalTactic (<- `(tactic| try refold $v))
+  Tactic.evalTactic (<- `(tactic| try refold $v))
+
+-- private def elabGive
+--   (v : TSyntax `ident) (as : TSyntaxArray `ident)
+--   (tac : TSyntax `Lean.Parser.Tactic.tacticSeq)
+--   : Tactic.TacticM Unit := Tactic.withMainContext do
+--   let id := calc_name v.getId
+--   let mctx <- getMCtx
+--   let mut found_mv : Option MVarId := none
+--   for (mv, decl) in mctx.decls do
+--     if decl.userName = id then do
+--       found_mv := mv
+--   let some target := found_mv
+--     | throwErrorAt v "unknown calculation target named '{id}'"
+--   let res <- target.withContext <| do
+--     Tactic.evalTacticAt tac target
+--   let ids := as.toList.map (·.getId)
+--   for (i, r) in ids.zip res do
+--     r.setUserName (calc_name i)
+--   for r in res do
+--     r.setKind .natural
+--   Tactic.appendGoals res
+--   -- Tactic.appendGoals res
+--   -- let goals <- Tactic.getGoals
+--   -- let goals' <- goals.flatMapM fun goal => do
+--   --   if goal == target then
+--   --     let res <- Tactic.evalTacticAt tac goal
+--   --     let ids := as.toList.map (·.getId)
+--   --     for (i, r) in ids.zip res do
+--   --       r.setUserName i
+--   --     for r in res do
+--   --       r.setUserName (calc_name (<- r.getTag))
+--   --     pure res
+--   --   else
+--   --     pure [goal]
+--   -- Tactic.setGoals goals'
+--   Tactic.evalTactic (<- `(tactic| try refold $v))
+
+@[inherit_doc elabGive]
+elab (name := giveAsTactic) "give " v:ident "as" as:ident,* " => " tac:tacticSeq : tactic
+  => elabGive v as tac
+@[inherit_doc elabGive]
+elab (name := giveTactic) "give " v:ident " => " tac:tacticSeq : tactic
+  => elabGive v #[] tac
+
+elab "give?" : tactic => Tactic.withMainContext do
+  let mctx <- getMCtx
+
+#allow_unused_tactic! giveAsTactic
+#allow_unused_tactic! giveTactic
 
 declare_syntax_cat calc_name
 syntax ident : calc_name
@@ -481,12 +544,14 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   -- recursor binding from above
   let main_mv <- Tactic.getMainGoal
   let field_mvs <- main_mv.constructor
+  for fmv in field_mvs do
+    fmv.setKind .syntheticOpaque
   Tactic.pushGoals field_mvs
   for (field_name, as_name, (mv_val, _fv), stx) in vals do
     let some field_mv <- field_mvs.findM? fun u => u.getTag <&> (· == field_name)
       | throwErrorAt stx "bug: unknown field name: {field_name}"
     field_mv.assign mv_val
-    field_mv.setUserName as_name
+    field_mv.setUserName (calc_name as_name)
 
 @[inherit_doc calculateTactic]
 elab (name := calculateGoal) "calculate" "⊢" "as" r:ident : tactic => Tactic.withMainContext do
@@ -586,5 +651,117 @@ def restructure (tacs : TSyntaxArray `tactic) : TacticM Unit := focus do
 
 elab "restructuring" "[" tacs:tactic* "]" : tactic => restructure tacs
 elab "restructuring" : tactic => restructure #[]
+
+/-
+Things that would be good, then:
+
+  * `define f (.ctor a b c) := ...` automatically refines/gives the function as a .rec instance
+    -> `f = .rec P Q R`
+  * `define f n m | m < 0 := ...` automatically
+    - If before: `f = .rec () g`
+    -> then: `f =
+-/
+
+inductive Colour where
+  | Red
+  | Blue
+  | Green
+
+compile_inductive% Colour
+
+-- set_option pp.mvars.delayed true
+
+structure Eg where
+  f : Nat -> Nat
+  g : Colour -> Int
+  correct : ∀ n, f n <= n
+
+-- def eg : Eg := by
+--   calculate f, g
+--   give f => apply Nat.rec
+--   give g => apply Colour.rec
+--   give f.zero => exact 0
+--   have p : f 0 = 0 := by
+--     trivial
+--   have r : f 5 = 0 := by
+--     give f.succ as f.a, f.b =>
+--       refine fun n nf =>
+--         if h : n = 4 then
+--           ((?_ : ℕ -> ℕ -> ℕ) n nf)
+--         else
+--           ((?_ : ℕ -> ℕ -> ℕ) n nf)
+--     give f.a => exact fun n nf => 0
+--     reduce
+--     rfl
+--   give f.b => exact fun n nf => n
+--   give g.Red => exact 10
+--   have q : g .Red = 10 := by
+--     reduce
+--     rfl
+--   give g.Blue => exact 15
+--   give g.Green => exact 20
+--   case correct =>
+--     intro n
+--     induction n
+--     all_goals grind
+
+elab "mv_info" v:ident : tactic => withMainContext do
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? v.getId
+    | throwError "unknown mvar"
+  let decl := mctx.getDecl mv
+  logInfo m!"found decl for {v.getId}
+  type: {<- mv.getType}
+  expr: {Expr.mvar mv}
+  synthetic? {decl.kind.isSyntheticOpaque}
+  readonly? {<- mv.isReadOnly}
+  declared? {<- mv.isDeclared}
+  delayed?  {<- mv.isDelayedAssigned}
+  assigned? {<- mv.isAssigned}"
+
+def eg2 : Eg := by
+  calculate f, g
+  give f => apply Nat.rec
+  give g => apply Colour.rec
+  give f.zero => exact 0
+  have p : f 0 = 0 := by
+    trivial
+  have r : f 5 = 0 := by
+    give f.succ as f.a, f.b => refine fun n nf => if h : n = 4 then ?_ else ?_
+    give f.a => exact 0
+    reduce
+    rfl
+  give f.b => exact n
+  give g.Red => exact 10
+  have q : g .Red = 10 := by
+    reduce
+    rfl
+  give g.Blue => exact 15
+  give g.Green => exact 20
+  case correct =>
+    intro n
+    induction n
+    all_goals grind
+
+def eg3 : Eg := by
+  calculate f, g
+  give f => apply Nat.rec
+  give f.zero => exact 0
+  have p : f 0 = 0 := by
+    trivial
+  have r : f 5 = 0 := by
+    give f.succ as f.a, f.b => refine fun n nf => if n = 4 then ?_ else ?_
+    -- unfold f
+    -- rw [Nat.rec_eq_recCompiled]
+    -- unfold Nat.recCompiled
+    -- simp
+    give f.a => exact 0
+    rfl
+  give g => intro c; exact 0
+  case correct =>
+    give f.b => exact n
+    intro n
+    induction n
+    all_goals grind
 
 end Tactic.Calculation

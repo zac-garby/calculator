@@ -15,7 +15,7 @@ structure RevSpec a : Type where
 
 def revCalc {a} : RevSpec a := by
   calculate fastrev
-  given_by fastrev => apply List.rec
+  give fastrev => apply List.rec
   intro xs
   induction xs <;> intro ys
   case nil => calc
@@ -41,22 +41,6 @@ def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
 
 open List
 
-open Lean Meta Tactic Elab Macro
-
-elab "debug" : tactic => Tactic.withMainContext do
-  -- let mctx <- getMCtx
-  -- for (mv, decl) in mctx.decls do
-  --   if !decl.userName.isAnonymous then
-  --     dbg_trace f!"  * mv {mv.name}; {decl.userName}"
-  let lctx <- getLCtx
-  for decl in lctx.decls do
-    if let some decl := decl then
-      dbg_trace f!"- local {decl.userName}
-  impl: {decl.isImplementationDetail}
-  aux: {decl.isAuxDecl}"
-      if let some val := decl.value? then
-        dbg_trace f!"   = {<- ppExpr val}"
-
 abbrev Sorted (xs : List Nat) := Pairwise (· ≤ ·) xs
 
 structure SortSpec where
@@ -67,8 +51,8 @@ structure SortSpec where
 /-
 def sortCalc : SortSpec := by
   calculate ins, sort
-  given_by ins => apply List.rec
-  given_by sort => apply List.rec
+  give ins => apply List.rec
+  give sort => apply List.rec
   intro xs
   induction xs
   case correct.nil => tauto
@@ -81,43 +65,43 @@ def sortCalc : SortSpec := by
     grind
 -/
 
-def sortCalc : SortSpec := by
-  calculate ins, sort
-  given_by ins => apply List.rec
-  given_by sort => apply List.rec
-  intro xs
-  induction xs
-  case correct.nil => tauto
-  case correct.cons x xs ih =>
-    unroll sort
-    have h : ∀ n ns, Sorted ns
-                  -> Sorted (ins ns n) ∧ (n :: ns) ~ (ins ns n) := ?q
-    define sort (x :: xs) := ins (sort xs) x
-    grind
-    · intro n ns
-      induction ns with
-      | nil =>
-        define ins [] n := [n]
-        grind
-      | cons u us ih_u =>
-        intro s
-        simp at s; rw [<- Sorted] at s
-        obtain ⟨h1, h2⟩ := s
-        obtain ⟨r1, r2⟩ := ih_u h2
-        constructor
-        cases decide (n <= u)
-          | false =>
-            define ins (u :: us) n := u :: ins us n
-            unroll ins
-            constructor
-            · grind
-            · grind
-          | true =>
-            -- define ins (u :: us) n := n :: u :: us
-            unroll ins
-            constructor
-            · grind
-            · constructor <;> grind
+-- def sortCalc : SortSpec := by
+--   calculate ins, sort
+--   give ins => apply List.rec
+--   give sort => apply List.rec
+--   intro xs
+--   induction xs
+--   case correct.nil => tauto
+--   case correct.cons x xs ih =>
+--     unroll sort
+--     have h : ∀ n ns, Sorted ns
+--                   -> Sorted (ins ns n) ∧ (n :: ns) ~ (ins ns n) := ?q
+--     define sort (x :: xs) := ins (sort xs) x
+--     grind
+--     · intro n ns
+--       induction ns with
+--       | nil =>
+--         define ins [] n := [n]
+--         grind
+--       | cons u us ih_u =>
+--         intro s
+--         simp at s; rw [<- Sorted] at s
+--         obtain ⟨h1, h2⟩ := s
+--         obtain ⟨r1, r2⟩ := ih_u h2
+--         constructor
+--         cases decide (n <= u)
+--         case true =>
+--           define ins (u :: us) n := n :: u :: us
+--           unroll ins
+--           constructor
+--           · grind
+--           · constructor <;> grind
+--         case false =>
+--           define ins (u :: us) n := u :: ins us n
+--           unroll ins
+--           constructor
+--           · grind
+--           · grind
 
 -- #print sortCalc
 
@@ -150,8 +134,8 @@ structure CompSpec where
 
 def comp_calc : CompSpec := by
   calculate comp, exec
-  given_by comp => apply Exp.rec
-  given_by exec => apply Code.rec
+  give comp => apply Exp.rec
+  give exec => apply Code.rec
   intro e
   induction e <;> intros c s
   -- Case val n:

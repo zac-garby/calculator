@@ -1,0 +1,98 @@
+
+private def props_names (n : Name) : MetaM (Name × Name) := do
+  let props_name := .str n "props"
+  let has_props_name := .str n "has_props"
+  return (props_name, has_props_name)
+
+private def byPropertiesSetup (vs : Array (TSyntax `ident)) : TacticM Unit := withMainContext do
+  let ids <- vs.mapM fun v => do
+    let id := v.getId
+    if let some _ := (<- getMCtx).findUserName? id then
+      pure id
+    else
+      throwError "unknown goal called '{id}'"
+  let goals <- Tactic.getGoals
+  let goals' <- goals.flatMapM fun goal => do
+    let decl <- goal.getDecl
+    if decl.userName ∈ ids then
+      let (props_name, has_props_name) <- props_names decl.userName
+      let props_ty <- Tactic.elabTerm (<- `(List Prop)) none
+      let props <- mkFreshExprMVar props_ty (userName := props_name)
+      let has_props <- mkFreshExprMVar props (userName := has_props_name)
+      let nil := Expr.app (<- mkConst' ``List.nil) props_ty
+      props.mvarId!.assign nil
+      has_props.mvarId!.assign nil
+      pure [props.mvarId!, has_props.mvarId!, goal]
+    else
+      pure [goal]
+  Tactic.setGoals goals'
+  for v in vs do
+    Tactic.evalTactic (<- `(tactic| try refold $v))
+
+private def collectObligationsM : TacticM Unit := do
+  let mctx ← getMCtx
+  let mut obligations : Array MVarId := #[]
+  for (mv, decl) in mctx.decls do
+    if let .str _ "prop_obl" := decl.userName then
+      if !(← mv.isAssigned) then
+        obligations := obligations.push mv
+  appendGoals obligations.toList
+
+elab "by_properties " vs:ident,+ : tactic => byPropertiesSetup vs.getElems
+
+elab "by_properties " vs:ident,+ tacs:tacticSeq : tactic => do
+  byPropertiesSetup vs.getElems
+  evalTactic tacs
+  collectObligationsM
+
+elab "assume " v:ident ": " t:term : tactic => do
+  let mctx <- getMCtx
+  let (props_name, has_props_name) <- props_names v.getId
+  let (some props, some has_props)
+    := (mctx.findUserName? props_name, mctx.findUserName? has_props_name)
+    | throwErrorAt v "goal {v} has not been declared as 'by_properties'"
+  let (new_prop, new_proof) <- props.withContext do
+    let new_prop <- Tactic.elabTerm t (<- props.getType)
+    let new_proof <- mkFreshExprMVar new_prop
+      (userName := <- getUnusedUserName (.str v.getId "prop_obl"))
+    assert! <- props.isAssigned
+    let (some old_props, some old_has_props)
+      := (<- getExprMVarAssignment? props, <- getExprMVarAssignment? has_props)
+      | throwError "bug: couldn't find old mvar assignment"
+    let props_ty <- Tactic.elabTerm (<- `(List Prop)) none
+    let concat := Expr.app (<- mkConst' ``List.concat) props_ty
+    props.assign <| <- reduce (mkApp2 concat old_props new_prop)
+    has_props.assign <| <- reduce (mkApp2 concat old_has_props new_proof)
+    return (new_prop, new_proof)
+  withMainContext do
+    let goal <- getMainGoal
+    let hname <- getUnusedUserName (.str .anonymous "h")
+    let (_, goal') <- goal.let hname new_proof new_prop
+    replaceMainGoal [goal']
+  return ()
+
+def derive_from (goal : MVarId) (prop : Expr) : MetaM Unit := do
+  let username := (<- getMCtx).getDecl goal |>.userName
+  let (props_name, has_props_name) <- props_names username
+  logInfo m!"deriving {username} by: {prop}"
+  forallTelescope prop fun ts r => do
+    for t in ts do
+      logInfo m!" - {t} : {<- inferType t}"
+    logInfo m!" -> {r}"
+  return ()
+
+elab "derive" : tactic => withMainContext do
+  let mctx <- getMCtx
+  let goal_decl <- getMainDecl
+  let goal <- getMainGoal
+  let (props_name, has_props_name) <- props_names goal_decl.userName
+  let (some props, some has_props)
+    := (mctx.findUserName? props_name, mctx.findUserName? has_props_name)
+    | throwError "goal {goal_decl.userName} has not been declared as 'by_properties'"
+  props.withContext do
+    let props_list_ty <- reduce (.mvar props)
+    let some (t, props_list) := props_list_ty.listLit?
+      | throwError "properties list '{props_name}' is not a list of properties"
+    props.withContext do
+      for prop in props_list do
+        derive_from goal prop
