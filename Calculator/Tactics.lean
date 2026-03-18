@@ -1,5 +1,6 @@
 import Mathlib.Tactic.Common
 import Mathlib.Util.CompileInductive
+import Calculator.Pattern
 
 namespace Tactic.Calculation
 
@@ -7,8 +8,7 @@ set_option linter.hashCommand false
 set_option linter.style.setOption false
 set_option pp.fieldNotation false
 
-open Option List
-open Lean Meta Elab Term Macro Mathlib.Tactic Qq
+open Option List Lean Meta Elab Term Macro Mathlib.Tactic Qq
 
 macro "don't" "care" : term => `(panic! "found out the hard way that we do actually care")
 
@@ -386,6 +386,345 @@ elab (name := defineTactic)
         Tactic.evalTactic (<- `(tactic| try rfl))
   | _ => throwUnsupportedSyntax
 
+declare_syntax_cat give_mode
+syntax "as"  ident+ : give_mode
+syntax "as?" ident* : give_mode
+
+declare_syntax_cat give_by
+syntax "recursion" : give_by
+syntax "cases" : give_by -- Still use recursor, probably
+syntax "if " Parser.Term.matchDiscr : give_by
+syntax "intro " ident* : give_by
+
+/--
+Refine a metavariable by applying a tactic.
+
+Typically used in calculations, for instance:
+
+  ```lean
+  calculate comp
+  give comp => apply Exp.rec
+  ```
+
+`calculate comp` introduces a metavar named `comp`, which is then refined
+into a recursive definition with a new metavar for each constructor's case.
+-/
+syntax (name := giveTactic)
+  "give" ident binderIdent* (give_mode)? " => " tacticSeq : tactic
+@[inherit_doc giveTactic] syntax (name := giveAskTactic)
+  "give?" : tactic
+@[inherit_doc giveTactic] syntax (name := giveDefTactic)
+  "give" term " := " term : tactic
+@[inherit_doc giveTactic] syntax (name := giveByTactic)
+  "give " ident " by " give_by : tactic
+
+#allow_unused_tactic! giveTactic
+#allow_unused_tactic! giveAskTactic
+#allow_unused_tactic! giveDefTactic
+#allow_unused_tactic! giveByTactic
+
+/- Should support:
+ * define f x y := body
+  -> give f => intros x y; exact body
+ * define f (.ctor a b) x y := body
+  ->
+
+Maybe we need extra metadata, so like
+ * by_recursion f
+  -> give f => apply <Type>.rec
+    but also, registers the patterns somewhere: e.g.
+    f [] ⋯ := body
+     => f.nil ⋯ := body
+    f (a :: as) ⋯ := body
+     => f.cons a as f.as ⋯ := body [f as ⋯ -> f.as ⋯]
+ * by_condition f x y z => h : c
+  -> give f => refine fun x y z => if h : c then blank else blank
+     registers patterns:
+     f x y z (h = true) := body
+      => f x y z
+     f x y z (h = false) := body
+  (h : c is a matchDiscr parser type)
+
+Example
+
+* calculate f   (f : Nat -> List Nat -> Nat -> List Nat)
+  - Patterns: [f * * *]
+  by_recursion f n xs at xs
+  - Patterns: [f * [] *, f * (* :: *) *]
+  by_condition f n [] m => h : n = m
+  - Patterns: [
+      f * [] * (* := true),
+      f * [] * (* := false),
+      f * (* :: *) *
+    ]
+  define f x [] y (h := true) := ...
+  - Patterns: [
+      f * [] * (* := false),
+      f * (* :: *) *
+    ]
+-/
+
+private def elabGiveDef (p to_term : Term) : Tactic.TacticM Unit
+  := Tactic.withMainContext do
+  let mctx <- getMCtx
+  match p with
+  | `($f:ident) => do
+    let (some mv) := mctx.findUserName? f.getId
+      | throwErrorAt f "No calculation target found: '{f.getId}'"
+    let mv_ty <- mv.getType''
+    let to_expr <- elabTerm to_term (some mv_ty)
+    define_mv f.getId to_expr
+  | `($f:ident $rest*) => do
+    let (some mv) := mctx.findUserName? f.getId
+      | throwErrorAt f "No calculation target found: '{f.getId}'"
+    let mv_ty <- mv.getType''
+    let (args, _) := unarrow mv_ty
+    let patterns <- patternsRef.get
+    for pattern in patterns do
+      if pattern.fmv != mv then continue
+      if let some names <- pattern.ps.match rest.toList args then
+        let ctx := { names, body := to_term, goal_name := f, goal_ty := mv_ty }
+        discard <| pattern.repl ctx
+        -- patternsRef.modify fun ps => ps.erase pattern
+        return ()
+    throwErrorAt p "No matching 'give' definition pattern found."
+  | _ => throwUnsupportedSyntax
+
+private def elabGiveExact
+  (v : Name) (val : Expr)
+  : Tactic.TacticM Unit := Tactic.withMainContext do
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? v
+    | throwError "Unknown goal called '{v}'"
+  -- If the named mv isn't a goal already, then make it one
+  let goals <- Tactic.getGoals
+  let already_goal <- goals.anyM (fun g => do return (<- g.getTag) = v)
+  if !already_goal then
+    Tactic.appendGoals [mv]
+  -- Then, evaluate the tactic over it, finding it in the goals list
+  let goals <- Tactic.getGoals
+  let some goal <- goals.findM? fun goal => do return v = (<- goal.getTag)
+    | unreachable!
+  let actualTy <- inferType val
+  let goalTy <- goal.getType
+  if !(<- isDefEq actualTy goalTy) then
+    throwError "Wrong type in 'give' for {v}. \
+    expected: {indentD goalTy}\n\
+    but got {indentD actualTy}"
+  goal.assignIfDefEq val
+  Tactic.evalTactic (<- `(tactic| try refold $(mkIdent v)))
+
+private def elabGive
+  (v : TSyntax `ident) (args : TSyntaxArray `Lean.binderIdent)
+  (asIds : TSyntaxArray `ident)
+  (tac : TSyntax `Lean.Parser.Tactic.tacticSeq)
+  (keepGoals : Bool := false)
+  : Tactic.TacticM (List MVarId) := Tactic.withMainContext do
+  let id := calc_name v.getId
+  let ids := asIds.toList.map (·.getId)
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? id
+    | throwErrorAt v "Unknown goal called '{id}'"
+  -- If the named mv isn't a goal already, then make it one
+  let goals <- Tactic.getGoals
+  let already_goal <- goals.anyM (fun g => do return (<- g.getTag) = id)
+  if !already_goal then
+    Tactic.appendGoals [mv]
+  -- Then, evaluate the tactic over it, finding it in the goals list
+  let goals <- Tactic.getGoals
+  let some goal <- goals.findM? fun goal => do return id = (<- goal.getTag)
+    | unreachable!
+  let goal <- Tactic.renameInaccessibles goal args
+  let res <- Tactic.evalTacticAt tac goal
+  if ids.length > res.length then
+    throwErrorAt asIds[res.length]!
+      "Too many 'as' names given! the tactic generated {res.length} goals"
+  for (i, r) in ids.zip res do
+    r.setUserName i
+  for r in res do
+    r.setKind .syntheticOpaque
+  -- If we produce exactly one goal, and it has the same name as the original
+  -- mvar which giving, then it should remain a visible goal.
+  if keepGoals then
+    Tactic.appendGoals res
+  else if let [mv] := res then
+    if already_goal && (<- mv.getTag) = id then
+      Tactic.appendGoals [mv]
+  Tactic.evalTactic (<- `(tactic| try refold $v))
+  return res
+
+def elabGiveBy (v : TSyntax `ident) (b : TSyntax `give_by) : Tactic.TacticM Unit
+  := Tactic.withMainContext do
+  let id := v.getId
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? id
+    | throwErrorAt v "Unknown goal called '{id}'"
+  let mv_ty <- mv.getType''
+  let (args, retTy) := unarrow mv_ty
+  let some (_, motive) := mv_ty.arrow?
+    | throwErrorAt v "Cannot refine {v}, of type {mv_ty}, by recursion, \
+      (it is not a function type)"
+  match b with
+  | `(give_by| recursion) => do
+    let (inp_ty :: rest_args) := args
+      | throwErrorAt b "Cannot refine {v}, of type {mv_ty}, by recursion"
+    matchConstInduct (inp_ty.getAppFn)
+      (fun _ => throwErrorAt v "Cannot refine {v}, of input type {inp_ty}, \
+        by recursion (it is not an inductive type)")
+      <| fun ival us => do
+      let rec_name := mkRecName ival.name
+      let goal_names <- ival.ctors.mapM fun ctor => do
+        getUnusedUserName (ctor.replacePrefix ival.name id)
+      let goals <- elabGive v #[] (keepGoals := true)
+        (goal_names.toArray.map mkIdent)
+        (<- `(tacticSeq| apply $(mkIdent rec_name)))
+      assert! goals.length == goal_names.length
+      -- Register the new patterns
+      for (goal, ctor) in goals.zip ival.ctors do
+        let env <- getEnv
+        let some ctor_val := env.find? ctor
+          | throwError "Internal: couldn't find ctor {ctor} in environment"
+        let ctor_ty := ctor_val.instantiateTypeLevelParams us
+        let (cargs, _bs, r) <- forallMetaTelescope ctor_ty
+        if !(<- isDefEq r inp_ty) then
+          throwError f!"The constructor {ctor} yields {r}, not {inp_ty}"
+        -- Drop the parameter arguments, these don't go into the recursor ops
+        let cargs := cargs.drop ival.numParams
+        let mut goal_args <- cargs.mapM fun e => do
+          let mv := e.mvarId!
+          let tag <- mv.getTag
+          pure (<- mv.getType, tag)
+        -- Here, the goal args are just the visible constructor args, so we
+        -- add them to the pattern.
+        let ctor_patt := ArgPatt.ctor ctor (goal_args.toList.map (.var ·.snd))
+        -- Then, find the recursive arguments
+        -- let mut recursors
+        for carg in cargs do
+          let mv := carg.mvarId!
+          let cty <- carg.mvarId!.getType
+          if <- isDefEq cty inp_ty then
+            -- It's an inductive argument, so we get the recursive call arg.
+            let tag <- mv.getTag
+            let name := tag.str "rec"
+            goal_args := goal_args.push (motive, name)
+        -- And finally, the remaining arguments from the motive
+        let names <- getUnusedUserNames rest_args.length (.mkStr1 "x")
+        let rest_named := rest_args.zip names.toList
+        goal_args := goal_args ++ rest_named
+        let rest_patts := rest_named.map fun (_, name) => ArgPatt.var name
+        let patt := ctor_patt :: rest_patts
+        let pattern : Pattern := {
+          fname := id, fmv := mv, ps := patt
+          repl := fun ctx => do
+            let mut lctx <- getLCtx
+            let mut fvs := #[]
+            for (ty, old) in goal_args do
+              let fv <- mkFreshFVarId
+              fvs := fvs.push (Expr.fvar fv)
+              if let some (name', _) := ctx.names.get? old then
+                lctx := lctx.mkLocalDecl fv name' ty
+              else
+                lctx := lctx.mkLocalDecl fv old ty
+            let body <- ctx.body.raw.rewriteBottomUpM fun
+            | stx@`($f:ident $arg0:term $args:term*) => do
+              if f.getId = ctx.goal_name.getId then
+                let `($arg_id:ident) := arg0
+                  | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+                let arg_name := arg_id.getId
+                let some (old_name, _, _) := ctx.names.toList
+                  |>.find? (fun (_, n, _) => n == arg_name)
+                  | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+                let rec_name := old_name.str "rec"
+                `($(mkIdent rec_name) $args*)
+              else
+                return stx
+            | s => pure s
+            let fn <- withLCtx' lctx do
+              let body <- elabTermEnsuringType body retTy
+              mkLambdaFVars fvs body
+            elabGiveExact (<- goal.getTag) fn
+            return []
+        }
+        patternsRef.modify fun ps => ps.insert pattern
+    return ()
+  | _ => throwUnsupportedSyntax
+
+-- def test_patterns : List (Patt × Replacement) := [
+--   ([.var `x, .var `y], fun ctx => do
+--     let (_, retTy) := unarrow ctx.goal_ty
+--     let lctx <- getLCtx
+--     let (a, lctx) <- ctx.fvarOf `x lctx
+--     let (b, lctx) <- ctx.fvarOf `y lctx
+--     let fn <- withLCtx' lctx do
+--       let body <- elabTermEnsuringType ctx.body retTy
+--       mkLambdaFVars #[.fvar a, .fvar b] body
+--     elabGiveExact ctx.goal_name.getId fn
+--     return []
+--   ),
+--   ([.ctor ``List.cons [.var `x, .var `xs], .var `n], fun ctx => do
+--     let some (_, motive) := ctx.goal_ty.arrow?
+--       | throwError "not an arrow type"
+--     let (_, retTy) := unarrow ctx.goal_ty
+--     let lctx <- getLCtx
+--     let (a, lctx) <- ctx.fvarOf `x lctx
+--     let (b, lctx) <- ctx.fvarOf `xs lctx
+--     let (c, lctx, xsName, recName) <- do
+--       let fv <- mkFreshFVarId
+--       let (xsName, _) := ctx.names.get! `xs
+--       let recName := xsName.str "rec"
+--       pure (fv, lctx.mkLocalDecl fv recName motive, xsName, recName)
+--     let (d, lctx) <- ctx.fvarOf `n lctx
+--     let body <- ctx.body.raw.rewriteBottomUpM fun
+--       | stx@`($f:ident $arg0:term $args:term*) => do
+--         if f.getId = ctx.goal_name.getId then
+--           let `($arg_id:ident) := arg0
+--             | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+--           if arg_id.getId != xsName then
+--             throwErrorAt arg0 "Can't make recursive call on {arg0}"
+--           `($(mkIdent recName) $args*)
+--         else
+--           return stx
+--       | s => pure s
+--     let fn <- withLCtx' lctx do
+--       let body <- elabTermEnsuringType body retTy
+--       mkLambdaFVars (#[a, b, c, d].map (Expr.fvar ·)) body
+--     elabGiveExact (ctx.goal_name.getId.str "cons") fn
+--     return []
+--   )
+-- ]
+
+elab_rules : tactic
+  | `(tactic| give $v:ident $args:binderIdent* $mode:give_mode => $tac) =>
+    match mode with
+    | `(give_mode| as $vs:ident*) =>
+        discard <| elabGive v args vs tac
+    | `(give_mode| as? $vs:ident*) => Tactic.withMainContext do
+        let res <- elabGive v args vs tac
+        let names <- res.mapM fun mv => mv.getTag <&> (·.toString)
+        logInfoAt mode m!"Generated {res.length} goals: {String.intercalate ", " names}\n\
+        To rename them, use:\n  give {v} as x y z ... => {tac}"
+    | _ => throwUnsupportedSyntax
+  | `(tactic| give $v:ident $args:binderIdent* => $tac) =>
+    discard <| elabGive v args #[] tac
+  | `(tactic| give $p:term := $to_term:term) => do
+    elabGiveDef p to_term
+  | `(tactic| give $v:ident by $b:give_by) => do
+    elabGiveBy v b
+
+elab_rules : tactic
+  | `(tactic| give?) => Tactic.withMainContext do
+    let ps <- patternsRef.get
+    let mut fmt : MessageData := "Available 'give' patterns:"
+    for pattern in ps do
+      fmt := fmt ++ indentD (format pattern)
+    logInfo fmt
+    fmt := "Visible calculation targets for 'give':"
+    let mctx <- getMCtx
+    for (mv, decl) in mctx.decls do
+      if decl.userName.isAnonymous || (<- mv.isAssigned) then continue
+      fmt := fmt ++ mv
+    logInfo m!"{fmt}"
+
 #allow_unused_tactic! defineTactic
 
 def intro_let_in_main_goal (name : Name) (ty val : Expr) (isDef : Bool := true)
@@ -417,88 +756,22 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
   let field_ty <- inferType field >>= instantiateMVars
   calc_intro_other as_name field_ty
 
-/--
-Refine a metavariable by applying a tactic.
-
-Typically used in calculations, for instance:
-
-  ```lean
-  calculate comp
-  give comp => apply Exp.rec
-  ```
-
-`calculate comp` introduces a metavar named `comp`, which is then refined
-into a recursive definition with a new metavar for each constructor's case.
--/
-private def elabGive
-  (v : TSyntax `ident) (as : TSyntaxArray `ident)
-  (tac : TSyntax `Lean.Parser.Tactic.tacticSeq)
-  : Tactic.TacticM (List MVarId) := Tactic.withMainContext do
-  let id := calc_name v.getId
-  let ids := as.toList.map (·.getId)
-  let mctx <- getMCtx
-  let some mv := mctx.findUserName? id
-    | throwErrorAt v "Unknown goal called '{id}'"
-  -- If the named mv isn't a goal already, then make it one
-  let goals <- Tactic.getGoals
-  if !(<- goals.anyM (fun goal => do let t <- goal.getTag; return t = id)) then
-    Tactic.appendGoals [mv]
-  -- Then, evaluate the tactic over it, finding it in the goals list
-  let goals <- Tactic.getGoals
-  let some goal <- goals.findM? fun goal => do return id = (<- goal.getTag)
-    | unreachable!
-  let res <- Tactic.evalTacticAt tac goal
-  if ids.length > res.length then
-    throwErrorAt as[res.length]!
-      "Too many 'as' names given! the tactic generated {res.length} goals"
-  for (i, r) in ids.zip res do
-    r.setUserName i
-  for r in res do
-    r.setKind .syntheticOpaque
-  -- If we produce exactly one goal, and it has the same name as the original
-  -- mvar which giving, then it should remain a visible goal.
-  if let [mv] := res then
-    if (<- mv.getTag) = id then
-      Tactic.appendGoals [mv]
-  Tactic.evalTactic (<- `(tactic| try refold $v))
-  return res
-
-@[inherit_doc elabGive]
-elab (name := giveAsTactic)
-  "give " v:ident "as" vs:ident* " => " tac:tacticSeq : tactic
-  => discard <| elabGive v vs tac
-
-@[inherit_doc elabGive]
-elab (name := giveTactic)
-  "give " v:ident " => " tac:tacticSeq : tactic
-  => discard <| elabGive v #[] tac
-
-@[inherit_doc elabGive]
-elab (name := giveAsAskTactic)
-  "give " v:ident q:"as?" vs:ident* " => " tac:tacticSeq : tactic
-  => Tactic.withMainContext do
-  let res <- elabGive v vs tac
-  let names <- res.mapM fun mv => mv.getTag <&> (·.toString)
-  logInfoAt q m!"Generated {res.length} goals: {String.intercalate ", " names}\n\
-  To rename them, use:\n  give {v} as x y z ... => {tac}"
-
-elab (name := giveAskTactic)
-  "give?" : tactic => Tactic.withMainContext do
-  let mctx <- getMCtx
-  let mut fmt : MessageData := "Visible calculation targets for 'give':"
-  for (mv, decl) in mctx.decls do
-    if decl.userName.isAnonymous || (<- mv.isAssigned) then continue
-    fmt := fmt.compose mv
-  logInfo m!"{fmt}"
-
-#allow_unused_tactic! giveAsTactic
-#allow_unused_tactic! giveTactic
-#allow_unused_tactic! giveAsAskTactic
-#allow_unused_tactic! giveAskTactic
-
 declare_syntax_cat calc_name
 syntax ident : calc_name
 syntax ident "as" ident : calc_name
+
+elab (name := collectTac)
+  "collect " body:tacticSeq : tactic =>
+  Tactic.withMainContext do
+  patternsRef.set {}
+  let target <- Tactic.getMainTarget
+  Tactic.evalTactic body
+  -- Unsure if I still need this...
+  -- let mctx <- getMCtx
+  -- for (mv, decl) in mctx.decls do
+  --   if !decl.userName.isAnonymous &&
+  --      !(<- mv.isAssignedOrDelayedAssigned) then
+  --     Tactic.pushGoal mv
 
 /--
 Introduce a calculation for the current goal.
@@ -663,12 +936,60 @@ compile_inductive% Colour
 
 -- set_option pp.mvars.delayed true
 
+elab "mv_info" v:ident : tactic => withMainContext do
+  let mctx <- getMCtx
+  let some mv := mctx.findUserName? v.getId
+    | throwError "unknown mvar"
+  let decl := mctx.getDecl mv
+  logInfo m!"found decl for {v.getId}
+  name: {mv.name}
+  type: {<- mv.getType}
+  expr: {Expr.mvar mv}
+  synthetic? {decl.kind.isSyntheticOpaque}
+  readonly? {<- mv.isReadOnly}
+  declared? {<- mv.isDeclared}
+  delayed?  {<- mv.isDelayedAssigned}
+  assigned? {<- mv.isAssigned}"
+
 structure Eg where
   f : Nat -> Nat
   g : Colour -> Int
   correct : ∀ n, f n <= n
 
--- def eg : Eg := by
+syntax (name := blankHole) "blank" : term
+
+@[term_elab blankHole]
+def elabQ : TermElab := fun _stx typ? => do
+  tryPostponeIfNoneOrMVar typ?
+  let mv <- mkFreshExprMVar typ?
+  return mv
+
+def test_def : Int := by
+  let f : List Nat -> Nat -> Nat := ?f
+  give f by recursion
+  give f (x :: xs) n := f xs n
+  give f [] n := n
+  exact 0
+
+-- def eg :
+--     Σ' f : List Nat -> Nat -> List Nat,
+--     f [] 5 = [5]
+--   := by
+--   collect
+--     calculate fst as f
+--     -- give f (y :: ys) n a true := n
+--     give f => apply List.rec
+--     give f.nil as f.cond.true f.cond.false =>
+--       refine fun n => if h : n = 5 then blank else blank
+--     unfold f
+--     simp
+--     -- define2 f x y z (h := true) := [5]
+--     give f.cond.true => exact fun n h => [5]
+--     rfl
+--   give f.cond.false => exact fun n h => []
+--   give f.cons => exact fun n ns «f.ns» m => []
+
+-- def eg2 : Eg := by
 --   calculate f, g
 --   give f => apply Nat.rec
 --   give g => apply Colour.rec
@@ -676,16 +997,11 @@ structure Eg where
 --   have p : f 0 = 0 := by
 --     trivial
 --   have r : f 5 = 0 := by
---     give f.succ as f.a, f.b =>
---       refine fun n nf =>
---         if h : n = 4 then
---           ((?_ : ℕ -> ℕ -> ℕ) n nf)
---         else
---           ((?_ : ℕ -> ℕ -> ℕ) n nf)
---     give f.a => exact fun n nf => 0
+--     give f.succ as f.a f.b => refine fun n nf => if h : n = 4 then ?_ else ?_
+--     give f.a => exact 0
 --     reduce
 --     rfl
---   give f.b => exact fun n nf => n
+--   give f.b => exact n
 --   give g.Red => exact 10
 --   have q : g .Red = 10 := by
 --     reduce
@@ -697,98 +1013,61 @@ structure Eg where
 --     induction n
 --     all_goals grind
 
-elab "mv_info" v:ident : tactic => withMainContext do
-  let mctx <- getMCtx
-  let some mv := mctx.findUserName? v.getId
-    | throwError "unknown mvar"
-  let decl := mctx.getDecl mv
-  logInfo m!"found decl for {v.getId}
-  type: {<- mv.getType}
-  expr: {Expr.mvar mv}
-  synthetic? {decl.kind.isSyntheticOpaque}
-  readonly? {<- mv.isReadOnly}
-  declared? {<- mv.isDeclared}
-  delayed?  {<- mv.isDelayedAssigned}
-  assigned? {<- mv.isAssigned}"
+-- def eg3 : Eg := by
+--   calculate f, g
+--   give f => apply Nat.rec
+--   define f .zero := 0
+--   -- give f.zero => exact 0
+--   have p : f 0 = 0 := by
+--     trivial
+--   have r : f 5 = 0 := by
+--     give f.succ as f.a f.b => refine fun n nf => if n = 4 then ?_ else ?_
+--     -- unfold f
+--     -- rw [Nat.rec_eq_recCompiled]
+--     -- unfold Nat.recCompiled
+--     -- simp
+--     give f.a => exact 0
+--     rfl
+--   give g => intro c; exact 0
+--   case correct =>
+--     give f.b => exact n
+--     intro n
+--     induction n
+--     all_goals grind
 
-def eg2 : Eg := by
-  calculate f, g
-  give f => apply Nat.rec
-  give g => apply Colour.rec
-  give f.zero => exact 0
-  have p : f 0 = 0 := by
-    trivial
-  have r : f 5 = 0 := by
-    give f.succ as f.a f.b => refine fun n nf => if h : n = 4 then ?_ else ?_
-    give f.a => exact 0
-    reduce
-    rfl
-  give f.b => exact n
-  give g.Red => exact 10
-  have q : g .Red = 10 := by
-    reduce
-    rfl
-  give g.Blue => exact 15
-  give g.Green => exact 20
-  case correct =>
-    intro n
-    induction n
-    all_goals grind
+-- @[simp]
+-- def rev {a} : List a → List a
+--   | [] => []
+--   | x :: xs => rev xs ++ [x]
 
-def eg3 : Eg := by
-  calculate f, g
-  give f => apply Nat.rec
-  give f.zero => exact 0
-  have p : f 0 = 0 := by
-    trivial
-  have r : f 5 = 0 := by
-    give f.succ as f.a f.b => refine fun n nf => if n = 4 then ?_ else ?_
-    -- unfold f
-    -- rw [Nat.rec_eq_recCompiled]
-    -- unfold Nat.recCompiled
-    -- simp
-    give f.a => exact 0
-    rfl
-  give g => intro c; exact 0
-  case correct =>
-    give f.b => exact n
-    intro n
-    induction n
-    all_goals grind
+-- structure RevSpec a : Type where
+--   fastrev : List a -> List a -> List a
+--   correct : ∀ xs ys, rev xs ++ ys = fastrev xs ys
 
-@[simp]
-def rev {a} : List a → List a
-  | [] => []
-  | x :: xs => rev xs ++ [x]
+-- def revCalc {a} : RevSpec a := by
+--   calculate fastrev
+--   give fastrev => apply List.rec
+--   intro xs
+--   (induction xs) <;> intro ys
+--   case nil => calc
+--     rev [] ++ ys
+--     _ = ys
+--         := by rfl
+--     _ = fastrev [] ys
+--         := by define fastrev [] ys := ys
+--   case cons x xs ih => calc
+--     rev (x :: xs) ++ ys
+--     _ = rev xs ++ [x] ++ ys
+--         := by rfl
+--     _ = rev xs ++ ([x] ++ ys)
+--         := by simp only [List.append_assoc]
+--     _ = fastrev xs ([x] ++ ys)
+--         := by rw [ih]
+--     _ = fastrev xs (x :: ys)
+--         := by rfl
+--     _ = fastrev (x :: xs) ys
+--         := by define fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
-structure RevSpec a : Type where
-  fastrev : List a -> List a -> List a
-  correct : ∀ xs ys, rev xs ++ ys = fastrev xs ys
-
-def revCalc {a} : RevSpec a := by
-  calculate fastrev
-  give fastrev => apply List.rec
-  intro xs
-  (induction xs) <;> intro ys
-  case nil => calc
-    rev [] ++ ys
-    _ = ys
-        := by rfl
-    _ = fastrev [] ys
-        := by define fastrev [] ys := ys
-  case cons x xs ih => calc
-    rev (x :: xs) ++ ys
-    _ = rev xs ++ [x] ++ ys
-        := by rfl
-    _ = rev xs ++ ([x] ++ ys)
-        := by simp only [List.append_assoc]
-    _ = fastrev xs ([x] ++ ys)
-        := by rw [ih]
-    _ = fastrev xs (x :: ys)
-        := by rfl
-    _ = fastrev (x :: xs) ys
-        := by define fastrev (x :: xs) ys := fastrev xs (x :: ys)
-
-def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
+-- def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
 
 end Tactic.Calculation
