@@ -13,6 +13,10 @@ inductive ArgPatt where
   | bind (bindName bindVal : ArgPatt)
   deriving BEq, Hashable, Repr
 
+def ArgPatt.isVar (p : ArgPatt) : Bool := match p with
+  | var _ => true
+  | _ => false
+
 abbrev Patt := List ArgPatt
 
 private def fmtPatt : (p : ArgPatt) -> Format
@@ -62,7 +66,14 @@ partial def mkArgPatt (stx : Term) (typ? : Option Expr)
       throwErrorAt stx "Pattern has wrong type: {actual_ty}, but expected {ret_ty}"
     let (ctor, _) := exp.getAppFnArgs
     return (.ctor ctor (arg_patts.map (·.fst)), exp)
-  | _ => throwUnsupportedSyntax
+  | `($f:term) => do
+    let ret_ty <- typ?.getDM (mkFreshExprMVar none)
+    let fn <- elabTerm f ret_ty
+    let actual_ty <- inferType fn
+    if !(<- isDefEq actual_ty ret_ty) then
+      throwErrorAt stx "Pattern has wrong type: {actual_ty}, but expected {ret_ty}"
+    let (ctor, _) := fn.getAppFnArgs
+    return (.ctor ctor [], fn)
 
 def mkPatt (args : List Term) (typs : List Expr)
   : Tactic.TacticM (Patt × NameMap MVarId) := do
@@ -96,12 +107,8 @@ partial def Patt.matchPatt
 Match a list of arguments (term syntax nodes) against a pattern, to extract a mapping
 from names in the pattern `ps` to names in the arguments, and their types.
 -/
-partial def Patt.match (ps : Patt)
-  (args : List Term) (typs : List Expr := [])
+partial def Patt.match (ps qs : Patt) (mvs : NameMap MVarId)
   : Tactic.TacticM (Option (NameMap (Name × Expr))) := do
-  if ps.length ≠ args.length then
-    return none
-  let (qs, mvs) <- mkPatt args typs
   let (did?, names) <- (ps.matchPatt qs).run default
   if did? then
     let both <- names.toList.mapM fun (pn, qn) => do
@@ -131,6 +138,7 @@ def ReplacementCtx.fvarOf {m} [Monad m] [MonadNameGenerator m]
 structure Pattern where
   fname : Name
   fmv : MVarId
+  endpointMv : MVarId
   ps : Patt
   repl : Replacement
 
@@ -138,12 +146,63 @@ instance : ToFormat Pattern where
   format p := f!"{p.fname} {p.ps}"
 
 instance : BEq Pattern where
-  beq p q := p.fname == q.fname && p.ps == q.ps && p.fmv == q.fmv
+  beq p q := p.fname == q.fname
+    && p.ps == q.ps
+    && p.fmv == q.fmv
+    && p.endpointMv == q.endpointMv
 
 instance : Hashable Pattern where
   hash p := hash (p.fmv, p.fname, p.ps)
 
+abbrev PatternMap := Std.HashSet Pattern
+
+def PatternMap.find? (patts : PatternMap)
+  (fmv : MVarId) (args : List Term) (typs : List Expr)
+  : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
+  let (qs, mvs) <- mkPatt args typs
+  let patts := patts.filter fun p => p.fmv == fmv
+  for patt in patts do
+    if patt.ps.length ≠ qs.length then
+      return none
+    if let some names <- patt.ps.match qs mvs then
+      return some (patt, names)
+  if qs.all (·.isVar) then
+    -- Finally, if we didn't find any explicit matches, then we can use
+    -- a default pattern for a function.
+    if <- fmv.isAssigned then
+      return none
+    let ty <- fmv.getType''
+    let tag <- fmv.getTag
+    let (args, retTy) := unarrow ty
+    if args.length != mvs.size then
+      return none
+    let some names <- qs.match qs mvs
+      | throwError "Internal: pattern {qs} didn't match against itself!"
+    let pattern := {
+      fname := tag, fmv := fmv, endpointMv := fmv, ps := qs
+      repl := fun ctx => do
+        let mut lctx <- getLCtx
+        let mut fvs := #[]
+        for (argty, q) in args.zip qs do
+          let .var qv := q | unreachable!
+          let fv <- mkFreshFVarId
+          fvs := fvs.push (Expr.fvar fv)
+          lctx := lctx.mkLocalDecl fv qv argty
+        let fn <- withLCtx' lctx do
+          let body <- Term.elabTermEnsuringType ctx.body retTy
+          mkLambdaFVars fvs body
+        fmv.assignIfDefEq fn
+        return []
+    }
+    return some (pattern, names)
+  return none
+
 initialize
-  patternsRef : IO.Ref (Std.HashSet Pattern) <- IO.mkRef {}
+  patternsRef : IO.Ref PatternMap <- IO.mkRef {}
+
+def findMatch? (fmv : MVarId) (args : List Term) (typs : List Expr)
+  : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
+  let patts <- patternsRef.get
+  patts.find? fmv args typs
 
 end Tactic.Calculation
