@@ -138,10 +138,6 @@ private partial def find_substrings_aux {str} (s : String) acc (start : String.P
 def find_substrings (s src : String) : List (String.Pos.Raw × String.Pos.Raw)
   := find_substrings_aux s [] src.startPos
 
-private partial def unarrow (ty : Expr) : (List Expr × Expr) := match ty.arrow? with
-  | some (a, b) => let (xs, r) := unarrow b; (a :: xs, r)
-  | none => ([], ty)
-
 def all_suggestions : CalcSuggester := fun doc params goal lhs rhs => do
   let env <- getEnv
   let sugg_names := suggester_ext.getState env

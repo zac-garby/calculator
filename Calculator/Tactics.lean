@@ -25,18 +25,6 @@ elab "todo" : tactic => return ()
 elab "todo" "[" term "]" : tactic => return ()
 def no_proof := "todo"
 
-def subSimul (names : NameMap Name) (lctx : LocalContext) : LocalContext :=
-  let names := names.toList
-  let decls := names.map fun (old, _) => lctx.findFromUserName? old
-  (decls.zip names).foldl (init := lctx) fun lctx (decl, _old, new) =>
-    match decl with
-    | none => lctx
-    | some decl =>
-      let decl := decl.setUserName new
-      { lctx with
-        fvarIdToDecl := lctx.fvarIdToDecl.insert decl.fvarId decl,
-        decls := lctx.decls.set decl.index decl }
-
 def calc_name (name : Name) : Name
   := name
   where pre := Name.str .anonymous "ℂ"
@@ -511,7 +499,7 @@ private def elabGiveExact
   goal.assignIfDefEq val
   Tactic.evalTactic (<- `(tactic| try refold $(mkIdent v)))
 
-def showLCtx (lctx : Option LocalContext := none) : MetaM Format := do
+private def showLCtx (lctx : Option LocalContext := none) : MetaM Format := do
   let lctx := lctx.getD (<- getLCtx)
   let msg := Std.Format.join <| intersperse f!"\n  "
     (<- lctx.decls.toList.flatMap (·.toList) |>.mapM fun d =>
@@ -563,19 +551,21 @@ private def elabGive
   : TacticM (List MVarId) := do
   let id := calc_name v.getId
   let ids := asIds.toList.map (·.getId)
-  let mctx <- getMCtx
-  let some mv := if let some mv := mv? then some mv else mctx.findUserName? id
+  let goals <- Tactic.getGoals
+  let mut already_goal := true
+  let some mv <- if let some mv := mv? then do
+      -- If the given mv isn't a goal already, then make it one
+      let already <- goals.anyM (fun g => return g == mv)
+      if !already then
+        Tactic.appendGoals [mv]
+        already_goal := true
+      pure (some mv)
+    else
+      -- If no mv is given explicitly, we just find one with the username
+      goals.findM? fun goal => do return (<- goal.getTag) == id
     | throwErrorAt v "Unknown goal called '{id}'"
-  -- If the named mv isn't a goal already, then make it one
-  let goals <- Tactic.getGoals
-  let already_goal <- goals.anyM (fun g => return g == mv)
-  if !already_goal then
-    Tactic.appendGoals [mv]
   -- Then, evaluate the tactic over it, finding it in the goals list
-  let goals <- Tactic.getGoals
-  let some goal := goals.find? fun goal => goal == mv
-    | unreachable!
-  let goal <- Tactic.renameInaccessibles goal args
+  let goal <- Tactic.renameInaccessibles mv args
   let res <- Tactic.evalTacticAt tac goal
   if ids.length > res.length then
     throwErrorAt asIds[res.length]!
@@ -632,14 +622,8 @@ private def refineRecursion
   (goal_args : Array (Expr × Name)) (goal : MVarId)
   : Refinement := fun _ctx => goal.withContext do
   let mut goal := goal
-  -- let mut fvs := #[]
   for (_ty, old) in goal_args do
     let (_fv, goal') <- goal.intro old
-    -- let (fv, goal') <- if let some (name', _) := ctx.names.get? old then
-    --   goal.intro old
-    -- else
-    --   goal.intro old
-    -- fvs := fvs.push (Expr.fvar fv)
     goal := goal'
   return goal
 
@@ -691,23 +675,14 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
           let tag <- mv.getTag
           let fresh <- mkFreshUserName tag
           goal_args := goal_args.push (<- mv.getType, fresh)
+          -- Here, the goal args are just the visible constructor args, so we
+          -- add them to the pattern.
           ctor_patt_args := ctor_patt_args.concat (.var fresh)
+          -- Then, find the recursive arguments
           if <- isDefEq cty inp_ty then
             let recName := fresh.recOf id
             goal_args := goal_args.push (motive, recName)
-        -- Here, the goal args are just the visible constructor args, so we
-        -- add them to the pattern.
         let ctor_patt := ArgPatt.ctor ctor ctor_patt_args
-        -- Then, find the recursive arguments
-        -- let mut recursors
-        -- for carg in cargs do
-        --   let mv := carg.mvarId!
-        --   let cty <- carg.mvarId!.getType
-        --   if <- isDefEq cty inp_ty then
-        --     -- It's an inductive argument, so we get the recursive call arg.
-        --     let tag <- mv.getTag
-        --     let name <- mkFreshUserName (tag.str "rec")
-        --     goal_args := goal_args.push (motive, name)
         -- And finally, the remaining arguments from the motive
         let names <- rest_args.mapM fun _ => mkFreshBinderName
         let rest_named := rest_args.zip names
@@ -1124,7 +1099,7 @@ def test_def : Nat := by
 
 -- def revCalc {a} : RevSpec a := by
 --   calculate fastrev
---   give fastrev => apply List.rec
+--   give fastrev by recursion
 --   intro xs
 --   (induction xs) <;> intro ys
 --   case nil => calc
