@@ -2,6 +2,12 @@ import Mathlib.Tactic.Common
 import Mathlib.Util.CompileInductive
 import Calculator.Pattern
 
+namespace Lean
+
+def Name.recOf (name f : Name) := f ++ name
+
+end Lean
+
 namespace Tactic.Calculation
 
 set_option linter.hashCommand false
@@ -18,6 +24,18 @@ macro "don't" "care" : term => `(panic! "found out the hard way that we do actua
 elab "todo" : tactic => return ()
 elab "todo" "[" term "]" : tactic => return ()
 def no_proof := "todo"
+
+def subSimul (names : NameMap Name) (lctx : LocalContext) : LocalContext :=
+  let names := names.toList
+  let decls := names.map fun (old, _) => lctx.findFromUserName? old
+  (decls.zip names).foldl (init := lctx) fun lctx (decl, _old, new) =>
+    match decl with
+    | none => lctx
+    | some decl =>
+      let decl := decl.setUserName new
+      { lctx with
+        fvarIdToDecl := lctx.fvarIdToDecl.insert decl.fvarId decl,
+        decls := lctx.decls.set decl.index decl }
 
 def calc_name (name : Name) : Name
   := name
@@ -419,7 +437,7 @@ syntax (name := giveTactic)
 @[inherit_doc giveTactic] syntax (name := giveDefTactic)
   "give" term " := " term : tactic
 @[inherit_doc giveTactic] syntax (name := giveByTactic)
-  "give " ident " by " give_by : tactic
+  "give" term " by " give_by : tactic
 
 #allow_unused_tactic! giveTactic
 #allow_unused_tactic! giveAskTactic
@@ -469,7 +487,7 @@ Example
 
 private def elabGiveExact
   (v : Name) (val : Expr)
-  : TacticM Unit := Tactic.withMainContext do
+  : TacticM Unit := do
   let mctx <- getMCtx
   let some mv := mctx.findUserName? v
     | throwError "Unknown goal called '{v}'"
@@ -493,6 +511,14 @@ private def elabGiveExact
   goal.assignIfDefEq val
   Tactic.evalTactic (<- `(tactic| try refold $(mkIdent v)))
 
+def showLCtx (lctx : Option LocalContext := none) : MetaM Format := do
+  let lctx := lctx.getD (<- getLCtx)
+  let msg := Std.Format.join <| intersperse f!"\n  "
+    (<- lctx.decls.toList.flatMap (·.toList) |>.mapM fun d =>
+      return f!"* ({d.fvarId.name}) {d.userName} : {<- ppExpr d.type}")
+  return f!"lctx:\n  \
+  {msg}"
+
 private def elabGiveDef (p to_term : Term) : TacticM Unit
   := Tactic.withMainContext do
   let mctx <- getMCtx
@@ -509,13 +535,22 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
       | throwErrorAt f "No calculation target found: '{f.getId}'"
     let mv_ty <- mv.getType''
     let (args, _) := unarrow mv_ty
-    if let some (pattern, names) <- findMatch? mv rest.toList args then
-      let ctx := { names, body := to_term, goal_name := f, goal_ty := mv_ty }
-      discard <| pattern.repl ctx
-    else
-      throwErrorAt p "No matching 'give' definition pattern found, \
-        for pattern: {indentD p}\n\
-        It may already have been assigned."
+    let (qs, _mvs) <- mkPatt rest.toList args
+    let (pattern, names) <- findMatch mv rest.toList args (pattRef? := p)
+    let ctx := {names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := qs}
+    withRef to_term <| do
+      let hole <- pattern.refine ctx
+      hole.withContext do
+        let to_term' <- pattern.transform ctx to_term
+        -- Rename the local variables according to the names
+        -- given in the pattern.
+        let mut tempLCtx <- getLCtx
+        tempLCtx := subSimul (names.map fun _ (old, _) => old) tempLCtx
+        for (old, new, _ty) in ctx.names do
+          tempLCtx := tempLCtx.renameUserName (old.recOf f.getId) (new.recOf f.getId)
+        let val <- withLCtx' tempLCtx do
+          Tactic.elabTermEnsuringType to_term' (<- hole.getType)
+        hole.assignIfDefEq val
   | _ => do
     throwUnsupportedSyntax
 
@@ -524,20 +559,21 @@ private def elabGive
   (asIds : TSyntaxArray `ident)
   (tac : TSyntax `Lean.Parser.Tactic.tacticSeq)
   (keepGoals : Bool := false)
-  : TacticM (List MVarId) := Tactic.withMainContext do
+  (mv? : Option MVarId := none)
+  : TacticM (List MVarId) := do
   let id := calc_name v.getId
   let ids := asIds.toList.map (·.getId)
   let mctx <- getMCtx
-  let some mv := mctx.findUserName? id
+  let some mv := if let some mv := mv? then some mv else mctx.findUserName? id
     | throwErrorAt v "Unknown goal called '{id}'"
   -- If the named mv isn't a goal already, then make it one
   let goals <- Tactic.getGoals
-  let already_goal <- goals.anyM (fun g => do return (<- g.getTag) = id)
+  let already_goal <- goals.anyM (fun g => return g == mv)
   if !already_goal then
     Tactic.appendGoals [mv]
   -- Then, evaluate the tactic over it, finding it in the goals list
   let goals <- Tactic.getGoals
-  let some goal <- goals.findM? fun goal => do return id = (<- goal.getTag)
+  let some goal := goals.find? fun goal => goal == mv
     | unreachable!
   let goal <- Tactic.renameInaccessibles goal args
   let res <- Tactic.evalTacticAt tac goal
@@ -558,14 +594,66 @@ private def elabGive
   Tactic.evalTactic (<- `(tactic| try refold $v))
   return res
 
-def elabGiveBy (v : TSyntax `ident) (b : TSyntax `give_by) : TacticM Unit
-  := Tactic.withMainContext do
-  let id := v.getId
+private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
+  : TacticM Term := do
+  let body <- body.raw.rewriteBottomUpM fun
+  | stx@`($f:ident $args:term*) => do
+    let numPre := pre.length
+    for (pre, p) in args.toList.zip (ctx.ps.take numPre) do
+      let (r, _) <- mkArgPatt pre none |>.run' default
+      if r != p then
+        throwErrorAt stx "Can't make recursive call at {stx}\n\
+        Wrong index (i.e. non-recursive) arguments\n\
+        Expected: {f} {Std.format (ctx.ps.take numPre : Patt)} ..."
+    let (arg0 :: args) := args.drop numPre |>.toList
+      | throwErrorAt stx "Can't make recursive call at {stx}\n\
+      Not enough arguments"
+    if f.getId = ctx.goal_name.getId then
+      let `($arg_id:ident) := arg0
+        | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+      let arg_name := arg_id.getId
+      let some (old_name, new_name, _) := ctx.names.toList
+        |>.find? (fun (_, n, _) => n == arg_name)
+        | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+      let old_rec_name := old_name.recOf f.getId
+      let new_rec_name := new_name.recOf f.getId
+      if let some _recur := (<- getLCtx).findFromUserName? old_rec_name then
+        let s <- `($(mkIdent new_rec_name) $(args.toArray)*)
+        return s
+      else
+        throwErrorAt stx "Can't make recursive call in non-recursive case\n\
+        (Expecting in-scope {new_rec_name})"
+    else
+      return stx
+  | s => pure s
+  return .mk body
+
+private def refineRecursion
+  (goal_args : Array (Expr × Name)) (goal : MVarId)
+  : Refinement := fun _ctx => goal.withContext do
+  let mut goal := goal
+  -- let mut fvs := #[]
+  for (_ty, old) in goal_args do
+    let (_fv, goal') <- goal.intro old
+    -- let (fv, goal') <- if let some (name', _) := ctx.names.get? old then
+    --   goal.intro old
+    -- else
+    --   goal.intro old
+    -- fvs := fvs.push (Expr.fvar fv)
+    goal := goal'
+  return goal
+
+def elabGiveBy (v : Ident) (b : TSyntax `give_by)
+  (mv? : Option MVarId := none) (prePatt? : Option Pattern := none)
+  : TacticM Unit
+  := do
   let mctx <- getMCtx
-  let some mv := mctx.findUserName? id
+  let id := v.getId
+  let some rootMv := mctx.findUserName? id
     | throwErrorAt v "Unknown goal called '{id}'"
+  let mv := mv?.getD rootMv
   let mv_ty <- mv.getType''
-  let (args, retTy) := unarrow mv_ty
+  let (args, _retTy) := unarrow mv_ty
   let some (_, motive) := mv_ty.arrow?
     | throwErrorAt v "Cannot refine {v}, of type {mv_ty}, by recursion, \
       (it is not a function type)"
@@ -580,7 +668,7 @@ def elabGiveBy (v : TSyntax `ident) (b : TSyntax `give_by) : TacticM Unit
       let rec_name := mkRecName ival.name
       let goal_names <- ival.ctors.mapM fun ctor => do
         getUnusedUserName (ctor.replacePrefix ival.name id)
-      let goals <- elabGive v #[] (keepGoals := true)
+      let goals <- elabGive v #[] (keepGoals := true) (mv? := mv?)
         (goal_names.toArray.map mkIdent)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
       assert! goals.length == goal_names.length
@@ -595,64 +683,95 @@ def elabGiveBy (v : TSyntax `ident) (b : TSyntax `give_by) : TacticM Unit
           throwError f!"The constructor {ctor} yields {r}, not {inp_ty}"
         -- Drop the parameter arguments, these don't go into the recursor ops
         let cargs := cargs.drop ival.numParams
-        let mut goal_args <- cargs.mapM fun e => do
-          let mv := e.mvarId!
-          let tag <- mv.getTag
-          pure (<- mv.getType, tag)
-        -- Here, the goal args are just the visible constructor args, so we
-        -- add them to the pattern.
-        let ctor_patt := ArgPatt.ctor ctor (goal_args.toList.map (.var ·.snd))
-        -- Then, find the recursive arguments
-        -- let mut recursors
+        let mut goal_args := #[]
+        let mut ctor_patt_args := []
         for carg in cargs do
           let mv := carg.mvarId!
-          let cty <- carg.mvarId!.getType
+          let cty <- mv.getType
+          let tag <- mv.getTag
+          let fresh <- mkFreshUserName tag
+          goal_args := goal_args.push (<- mv.getType, fresh)
+          ctor_patt_args := ctor_patt_args.concat (.var fresh)
           if <- isDefEq cty inp_ty then
-            -- It's an inductive argument, so we get the recursive call arg.
-            let tag <- mv.getTag
-            let name := tag.str "rec"
-            goal_args := goal_args.push (motive, name)
+            let recName := fresh.recOf id
+            goal_args := goal_args.push (motive, recName)
+        -- Here, the goal args are just the visible constructor args, so we
+        -- add them to the pattern.
+        let ctor_patt := ArgPatt.ctor ctor ctor_patt_args
+        -- Then, find the recursive arguments
+        -- let mut recursors
+        -- for carg in cargs do
+        --   let mv := carg.mvarId!
+        --   let cty <- carg.mvarId!.getType
+        --   if <- isDefEq cty inp_ty then
+        --     -- It's an inductive argument, so we get the recursive call arg.
+        --     let tag <- mv.getTag
+        --     let name <- mkFreshUserName (tag.str "rec")
+        --     goal_args := goal_args.push (motive, name)
         -- And finally, the remaining arguments from the motive
-        let names <- getUnusedUserNames rest_args.length (.mkStr1 "x")
-        let rest_named := rest_args.zip names.toList
+        let names <- rest_args.mapM fun _ => mkFreshBinderName
+        let rest_named := rest_args.zip names
         goal_args := goal_args ++ rest_named
         let rest_patts := rest_named.map fun (_, name) => ArgPatt.var name
-        let patt := ctor_patt :: rest_patts
-        let pattern : Pattern := {
-          fname := id, fmv := mv, endpointMv := goal, ps := patt
-          repl := fun ctx => do
-            let mut lctx <- getLCtx
-            let mut fvs := #[]
-            for (ty, old) in goal_args do
-              let fv <- mkFreshFVarId
-              fvs := fvs.push (Expr.fvar fv)
-              if let some (name', _) := ctx.names.get? old then
-                lctx := lctx.mkLocalDecl fv name' ty
-              else
-                lctx := lctx.mkLocalDecl fv old ty
-            let body <- ctx.body.raw.rewriteBottomUpM fun
-            | stx@`($f:ident $arg0:term $args:term*) => do
-              if f.getId = ctx.goal_name.getId then
-                let `($arg_id:ident) := arg0
-                  | throwErrorAt arg0 "Can't make recursive call on {arg0}"
-                let arg_name := arg_id.getId
-                let some (old_name, _, _) := ctx.names.toList
-                  |>.find? (fun (_, n, _) => n == arg_name)
-                  | throwErrorAt arg0 "Can't make recursive call on {arg0}"
-                let rec_name := old_name.str "rec"
-                `($(mkIdent rec_name) $args*)
-              else
-                return stx
-            | s => pure s
-            let fn <- withLCtx' lctx do
-              let body <- Term.elabTermEnsuringType body retTy
-              mkLambdaFVars fvs body
-            elabGiveExact (<- goal.getTag) fn
-            return []
+        let mut pattern : Pattern := {
+          fname := id, fmv := rootMv, endpointMv := goal
+          ps := ctor_patt :: rest_patts
+          refine := refineRecursion goal_args goal,
+          transform := transformRecursion
         }
+        if let some prePatt := prePatt? then
+          pattern := { pattern with
+            ps := prePatt.ps ++ pattern.ps
+            transform ctx
+              := prePatt.transform ctx
+              >=> transformRecursion prePatt.ps ctx
+          }
         patternsRef.modify fun ps => ps.insert pattern
     return ()
   | _ => throwUnsupportedSyntax
+
+syntax (name := blankHole) "blank" ident : term
+
+def elabGivePattBy
+  (p : Term) (f : Ident) (rest : TSyntaxArray `term) (b : TSyntax `give_by)
+  : TacticM Unit := Tactic.withMainContext do
+  let mctx <- getMCtx
+  let (some mv) := mctx.findUserName? f.getId
+    | throwErrorAt f "No calculation target found: '{f.getId}'"
+  let mv_ty <- mv.getType''
+  let (args, _) := unarrow mv_ty
+  let (qs, _mvs) <- mkPatt rest.toList args
+  let (pattern, names) <- findMatch mv rest.toList args (pattRef? := p)
+  let tag <- mkFreshUserName (f.getId.str "body")
+  let body <- `(blank $(mkIdent tag))
+  let hole <- pattern.refine {
+    names, body, goal_name := f, goal_ty := mv_ty, ps := qs
+  }
+  hole.withContext do
+    let mut tempLCtx <- getLCtx
+    tempLCtx := subSimul (names.map fun _ (new, _) => new) tempLCtx
+    withLCtx' tempLCtx do
+      elabGiveBy f b (prePatt? := pattern) (mv? := hole)
+  return ()
+
+def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
+  := Tactic.withMainContext do
+  let some mv := (<- getMCtx).findUserName? v.getId
+    | throwErrorAt v "No calculation target found named '{v.getId}'"
+  let ps <- patternsRef.get
+  let mut fmt : MessageData := m!"Available 'give' patterns for {v}:"
+  let mut any := false
+  for pattern in ps do
+    if pattern.fmv != mv then continue
+    let endpoint := pattern.endpointMv
+    if (<- endpoint.isDeclared)
+        && !(<- endpoint.isAssignedOrDelayedAssigned) then
+      fmt := fmt ++ indentD (format pattern)
+      any := true
+  if any then
+    logInfo fmt
+  else
+    logInfo m!"No available 'give' patterns for {v}"
 
 elab_rules : tactic
   | `(tactic| give $v:ident $args:binderIdent* $mode:give_mode => $tac) =>
@@ -671,23 +790,12 @@ elab_rules : tactic
     elabGiveDef p to_term
   | `(tactic| give $v:ident by $b:give_by) => do
     elabGiveBy v b
-  | `(tactic| give? $v:ident) => Tactic.withMainContext do
-    let some mv := (<- getMCtx).findUserName? v.getId
-      | throwErrorAt v "No calculation target found named '{v.getId}'"
-    let ps <- patternsRef.get
-    let mut fmt : MessageData := "Available 'give' patterns:"
-    let mut any := false
-    for pattern in ps do
-      if pattern.fmv != mv then continue
-      let endpoint := pattern.endpointMv
-      if (<- endpoint.isDeclared)
-         && !(<- endpoint.isAssignedOrDelayedAssigned) then
-        fmt := fmt ++ indentD (format pattern)
-        any := true
-    if any then
-      logInfo fmt
-    else
-      logInfo m!"No available 'give' patterns for {v}"
+  | `(tactic| give $p:term by $b:give_by) =>
+    if let `($f:ident $rest*) := p then
+      elabGivePattBy p f rest b
+    else throwUnsupportedSyntax
+  | `(tactic| give? $v:ident) =>
+    elabGiveAsk v
 
 #allow_unused_tactic! defineTactic
 
@@ -920,25 +1028,26 @@ structure Eg where
   g : Colour -> Int
   correct : ∀ n, f n <= n
 
-syntax (name := blankHole) "blank" : term
-
 @[term_elab blankHole]
-def elabQ : TermElab := fun _stx typ? => do
-  tryPostponeIfNoneOrMVar typ?
-  let mv <- mkFreshExprMVar typ?
-  return mv
-
+def elabQ : TermElab := fun stx typ? => match stx with
+  | `(blank $v:ident) => do
+    tryPostponeIfNoneOrMVar typ?
+    let mv_expr <- mkFreshExprMVar typ?
+    let mv := mv_expr.mvarId!
+    mv.setTag v.getId
+    return mv_expr
+  | _ => throwUnsupportedSyntax
 
 def test_def : Nat := by
   let f : List Nat -> Nat -> Nat := ?f
   give f by recursion
-  let g : Nat -> Nat -> Nat := ?g
-  give f (x :: xs) n := f xs n
+  give f (u :: us) head := u + f us head
   give f [] n := n
-  -- give f.nil by recursion
-  -- give f.nil Nat.zero := 1
-  -- give f.nil (.succ n) := 2 * f.nil n
-  exact f [] 3
+  let g : Nat -> Nat -> Nat -> Nat := ?g
+  give g n by recursion
+  give g x Nat.zero n := x
+  give g x (Nat.succ m) n := g x m n
+  exact g 10 10 10
 
 -- def eg :
 --     Σ' f : List Nat -> Nat -> List Nat,

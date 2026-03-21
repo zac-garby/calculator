@@ -119,16 +119,21 @@ partial def Patt.match (ps qs : Patt) (mvs : NameMap MVarId)
   else
     return none
 
-structure ReplacementCtx where
+structure MatchCtx where
+  ps : Patt
   names : NameMap (Name × Expr)
   body : Term
   goal_name : TSyntax `ident
   goal_ty : Expr
 
-abbrev Replacement := ReplacementCtx -> Tactic.TacticM (List MVarId)
+abbrev Refinement := MatchCtx -> Tactic.TacticM MVarId
+abbrev Transformer := MatchCtx -> Term -> Tactic.TacticM Term
+
+instance : Inhabited Transformer where
+  default _ctx tm := return tm
 
 def ReplacementCtx.fvarOf {m} [Monad m] [MonadNameGenerator m]
-  (ctx : ReplacementCtx) (name : Name) (lctx : LocalContext)
+  (ctx : MatchCtx) (name : Name) (lctx : LocalContext)
   : m (FVarId × LocalContext) := do
   let fv <- mkFreshFVarId
   let (name', ty) := ctx.names.get! name
@@ -140,7 +145,8 @@ structure Pattern where
   fmv : MVarId
   endpointMv : MVarId
   ps : Patt
-  repl : Replacement
+  refine : Refinement
+  transform : Transformer := default
 
 instance : ToFormat Pattern where
   format p := f!"{p.fname} {p.ps}"
@@ -156,43 +162,45 @@ instance : Hashable Pattern where
 
 abbrev PatternMap := Std.HashSet Pattern
 
+def refineTakeArgs
+  (names : NameMap (Name × Expr)) (_mvs : NameMap MVarId)
+  (goal : MVarId)
+  : Refinement := fun _ctx => do
+  let mut goal := goal
+  for (old, _new, _ty) in names do
+    -- let .var qv := q | unreachable!
+    let (_fv, goal') <- goal.intro old
+    goal := goal'
+  return goal
+
 def PatternMap.find? (patts : PatternMap)
   (fmv : MVarId) (args : List Term) (typs : List Expr)
   : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
   let (qs, mvs) <- mkPatt args typs
   let patts := patts.filter fun p => p.fmv == fmv
   for patt in patts do
-    if patt.ps.length ≠ qs.length then
-      return none
-    if let some names <- patt.ps.match qs mvs then
-      return some (patt, names)
+    if patt.ps.length == qs.length then
+      if let some names <- patt.ps.match qs mvs then
+        return some (patt, names)
   if qs.all (·.isVar) then
-    -- Finally, if we didn't find any explicit matches, then we can use
-    -- a default pattern for a function.
     if <- fmv.isAssigned then
       return none
+    -- Finally, if we didn't find any explicit matches, then we can use
+    -- a default pattern for a function.
     let ty <- fmv.getType''
     let tag <- fmv.getTag
-    let (args, retTy) := unarrow ty
-    if args.length != mvs.size then
+    let (args, _) := unarrow ty
+    if args.length < mvs.size then
       return none
     let some names <- qs.match qs mvs
       | throwError "Internal: pattern {qs} didn't match against itself!"
+    -- let names <- names.toList.mapM fun (old, new, ty) => do
+    --   let fresh <- mkFreshUserName old
+    --   return (fresh, new, ty)
+    -- let names := .ofList names
     let pattern := {
       fname := tag, fmv := fmv, endpointMv := fmv, ps := qs
-      repl := fun ctx => do
-        let mut lctx <- getLCtx
-        let mut fvs := #[]
-        for (argty, q) in args.zip qs do
-          let .var qv := q | unreachable!
-          let fv <- mkFreshFVarId
-          fvs := fvs.push (Expr.fvar fv)
-          lctx := lctx.mkLocalDecl fv qv argty
-        let fn <- withLCtx' lctx do
-          let body <- Term.elabTermEnsuringType ctx.body retTy
-          mkLambdaFVars fvs body
-        fmv.assignIfDefEq fn
-        return []
+      refine := refineTakeArgs names mvs fmv
     }
     return some (pattern, names)
   return none
@@ -204,5 +212,18 @@ def findMatch? (fmv : MVarId) (args : List Term) (typs : List Expr)
   : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
   let patts <- patternsRef.get
   patts.find? fmv args typs
+
+def findMatch (fmv : MVarId) (args : List Term) (typs : List Expr)
+  (pattRef? : Option Term := none)
+  : Tactic.TacticM (Pattern × NameMap (Name × Expr)) := do
+  if let some (pattern, names) <- findMatch? fmv args typs then
+    return (pattern, names)
+  else
+    if let some p := pattRef? then
+      throwErrorAt p "No matching 'give' definition pattern found, \
+        for pattern: {indentD p}\n\
+        It may already have been assigned."
+    else
+      throwError "No matching 'give' definition pattern found."
 
 end Tactic.Calculation
