@@ -15,7 +15,23 @@ inductive ArgPatt where
   | var (name : Name)
   | ctor (ctorFn : Name) (ctorArgs : List ArgPatt)
   | bind (bindName bindVal : ArgPatt)
-  deriving BEq, Hashable, Repr
+  deriving Repr
+
+private partial def argPattEq (p q : ArgPatt) : Bool := match p, q with
+  | .var _a, .var _b => true
+  | .ctor pc pargs, .ctor qc qargs =>
+    pc == qc && (pargs.zip qargs |>.all (Function.uncurry argPattEq))
+  | .bind pn pv, .bind qn qv =>
+    argPattEq pn qn && argPattEq pv qv
+  | _, _ => false
+
+private def argPattHash (p : ArgPatt) : UInt64 := match p with
+  | .var _ => hash "name"
+  | .ctor n args => let args' := args.map argPattHash; hash (n, args')
+  | .bind n v => hash (argPattHash n, argPattHash v)
+
+instance : BEq ArgPatt where beq := argPattEq
+instance : Hashable ArgPatt where hash := argPattHash
 
 def ArgPatt.isVar (p : ArgPatt) : Bool := match p with
   | var _ => true
@@ -154,27 +170,48 @@ instance : BEq Pattern where
   beq p q := p.fname == q.fname
     && p.ps == q.ps
     && p.fmv == q.fmv
-    && p.endpointMv == q.endpointMv
 
 instance : Hashable Pattern where
   hash p := hash (p.fmv, p.fname, p.ps)
 
 abbrev PatternMap := Std.HashSet Pattern
 
-def refineTakeArgs
-  (names : NameMap (Name × Expr)) (_mvs : NameMap MVarId)
+initialize
+  patternsRef : IO.Ref PatternMap <- IO.mkRef {}
+
+def PatternMap.insert (pattern : Pattern) : MetaM Unit := do
+  patternsRef.modify fun (pm : Std.HashSet _) => pm.insert pattern
+
+private def refineTakeArgs
+  (names : List Name)
   (goal : MVarId)
   : Refinement := fun _ctx => do
   let mut goal := goal
-  for (old, _new, _ty) in names do
-    -- let .var qv := q | unreachable!
+  for old in names do
     let (_fv, goal') <- goal.intro old
     goal := goal'
   return goal
 
-def PatternMap.find? (patts : PatternMap)
+private def mkTakeArgsPattern (fmv : MVarId) (names? : Option (List Name) := none)
+  : MetaM (Option Pattern) := do
+  if <- fmv.isAssigned then
+    return none
+  let ty <- fmv.getType''
+  let tag <- fmv.getTag
+  let (args, _) := unarrow ty
+  let un <- getUnusedUserName (.mkStr1 "x")
+  let names := names?.getD <| args.mapIdx fun i _exp => un.appendIndexAfter i
+  let qs := names.map (.var ·)
+  let pattern : Pattern := {
+    fname := tag, fmv := fmv, endpointMv := fmv, ps := qs
+    refine := refineTakeArgs names fmv
+  }
+  return pattern
+
+def PatternMap.find?
   (fmv : MVarId) (args : List Term) (typs : List Expr)
   : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
+  let patts <- patternsRef.get
   let (qs, mvs) <- mkPatt args typs
   let patts := patts.filter fun p => p.fmv == fmv
   for patt in patts do
@@ -182,37 +219,30 @@ def PatternMap.find? (patts : PatternMap)
       if let some names <- patt.ps.match qs mvs then
         return some (patt, names)
   if qs.all (·.isVar) then
-    if <- fmv.isAssigned then
-      return none
-    -- Finally, if we didn't find any explicit matches, then we can use
-    -- a default pattern for a function.
-    let ty <- fmv.getType''
-    let tag <- fmv.getTag
-    let (args, _) := unarrow ty
-    if args.length < mvs.size then
-      return none
     let some names <- qs.match qs mvs
       | throwError "Internal: pattern {qs} didn't match against itself!"
-    -- let names <- names.toList.mapM fun (old, new, ty) => do
-    --   let fresh <- mkFreshUserName old
-    --   return (fresh, new, ty)
-    -- let names := .ofList names
-    let pattern := {
-      fname := tag, fmv := fmv, endpointMv := fmv, ps := qs
-      refine := refineTakeArgs names mvs fmv
-    }
-    return some (pattern, names)
+    if let some pattern <- mkTakeArgsPattern fmv names.keys then
+      return some (pattern, names)
   return none
 
-initialize
-  patternsRef : IO.Ref PatternMap <- IO.mkRef {}
+def allPatterns (fmv : MVarId) : Tactic.TacticM (List Pattern) := do
+  let ps <- patternsRef.get
+  let mut all := []
+  for pattern in ps do
+    if pattern.fmv != fmv then continue
+    let endpoint := pattern.endpointMv
+    if (<- endpoint.isDeclared) && !(<- endpoint.isAssignedOrDelayedAssigned) then
+      all := all.concat pattern
+  if all.isEmpty then
+    if let some default <- mkTakeArgsPattern fmv then
+      return [default]
+  return all
 
-def findMatch? (fmv : MVarId) (args : List Term) (typs : List Expr)
+def PatternMap.findMatch? (fmv : MVarId) (args : List Term) (typs : List Expr)
   : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
-  let patts <- patternsRef.get
-  patts.find? fmv args typs
+  PatternMap.find? fmv args typs
 
-def findMatch (fmv : MVarId) (args : List Term) (typs : List Expr)
+def PatternMap.findMatch (fmv : MVarId) (args : List Term) (typs : List Expr)
   (pattRef? : Option Term := none)
   : Tactic.TacticM (Pattern × NameMap (Name × Expr)) := do
   if let some (pattern, names) <- findMatch? fmv args typs then

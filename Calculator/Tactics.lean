@@ -3,9 +3,13 @@ import Mathlib.Util.CompileInductive
 import Calculator.Pattern
 
 namespace Lean
-
 def Name.recOf (name f : Name) := f ++ name
 
+def LocalContext.eraseUserName (lctx : LocalContext) (name : Name) :=
+  if let some fv := lctx.findFromUserName? name then
+    lctx.erase fv.fvarId
+  else
+    lctx
 end Lean
 
 namespace Tactic.Calculation
@@ -404,6 +408,16 @@ syntax "recursion" : give_by
 syntax "cases" : give_by -- Still use recursor, probably
 syntax "if " Parser.Term.matchDiscr : give_by
 syntax "intro " ident* : give_by
+syntax "aux " term : give_by
+
+private def giveByHelp := [
+  "recursion",
+  "cases",
+  "if P",
+  "if h : P",
+  "intro x y z ⋯",
+  "aux f x y z ⋯"
+]
 
 /--
 Refine a metavariable by applying a tactic.
@@ -524,7 +538,7 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
     let mv_ty <- mv.getType''
     let (args, _) := unarrow mv_ty
     let (qs, _mvs) <- mkPatt rest.toList args
-    let (pattern, names) <- findMatch mv rest.toList args (pattRef? := p)
+    let (pattern, names) <- PatternMap.findMatch mv rest.toList args (pattRef? := p)
     let ctx := {names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := qs}
     withRef to_term <| do
       let hole <- pattern.refine ctx
@@ -627,82 +641,106 @@ private def refineRecursion
     goal := goal'
   return goal
 
+private def applyPrePatt (prePatt? : Option Pattern) (pattern : Pattern) : Pattern :=
+  if let some prePatt := prePatt? then
+    { pattern with
+      ps := prePatt.ps ++ pattern.ps
+      transform ctx := prePatt.transform ctx >=> transformRecursion prePatt.ps ctx }
+  else
+    pattern
+
+private def buildCtorPattern
+  (id : Name) (rootMv : MVarId) (inp_ty motive : Expr) (us : List Level)
+  (rest_args : List Expr) (ival : InductiveVal) (ctor : Name) (goal : MVarId)
+  : MetaM Pattern := do
+  let env <- getEnv
+  let some ctor_val := env.find? ctor
+    | throwError "Internal: couldn't find ctor {ctor} in environment"
+  let ctor_ty := ctor_val.instantiateTypeLevelParams us
+  let (cargs, _bs, r) <- forallMetaTelescope ctor_ty
+  if !(<- isDefEq r inp_ty) then
+    throwError f!"The constructor {ctor} yields {r}, not {inp_ty}"
+  -- Drop the parameter arguments, these don't go into the recursor ops
+  let cargs := cargs.drop ival.numParams
+  let mut goal_args := #[]
+  let mut ctor_patt_args := []
+  for carg in cargs do
+    let mv := carg.mvarId!
+    let cty <- mv.getType
+    let tag <- mv.getTag
+    let fresh <- mkFreshUserName tag
+    goal_args := goal_args.push (<- mv.getType, fresh)
+    -- Here, the goal args are just the visible constructor args, so we
+    -- add them to the pattern.
+    ctor_patt_args := ctor_patt_args.concat (.var fresh)
+    -- Then, find the recursive arguments
+    if <- isDefEq cty inp_ty then
+      let recName := fresh.recOf id
+      goal_args := goal_args.push (motive, recName)
+  let ctor_patt := ArgPatt.ctor ctor ctor_patt_args
+  -- And finally, the remaining arguments from the motive
+  let names <- rest_args.mapM fun _ => mkFreshBinderName
+  let rest_named := rest_args.zip names
+  goal_args := goal_args ++ rest_named
+  let rest_patts := rest_named.map fun (_, name) => ArgPatt.var name
+  return {
+    fname := id, fmv := rootMv, endpointMv := goal
+    ps := ctor_patt :: rest_patts
+    refine := refineRecursion goal_args goal
+    transform := transformRecursion
+  }
+
 def elabGiveBy (v : Ident) (b : TSyntax `give_by)
   (mv? : Option MVarId := none) (prePatt? : Option Pattern := none)
-  : TacticM Unit
-  := do
+  : TacticM Unit := do
   let mctx <- getMCtx
-  let id := v.getId
-  let some rootMv := mctx.findUserName? id
-    | throwErrorAt v "Unknown goal called '{id}'"
-  let mv := mv?.getD rootMv
-  let mv_ty <- mv.getType''
-  let (args, _retTy) := unarrow mv_ty
-  let some (_, motive) := mv_ty.arrow?
-    | throwErrorAt v "Cannot refine {v}, of type {mv_ty}, by recursion, \
-      (it is not a function type)"
+  let vId := v.getId
+  let some rootMv := mctx.findUserName? vId
+    | throwErrorAt v "Unknown goal called '{vId}'"
+  let holeMv := mv?.getD rootMv
+  let holeTy <- holeMv.getType''
+  let (args, _retTy) := unarrow holeTy
   match b with
   | `(give_by| recursion) => do
+    let some (_, motive) := holeTy.arrow?
+      | throwErrorAt v "Cannot refine {v}, of type {holeTy}, by recursion \
+        (it is not a function type)"
     let (inp_ty :: rest_args) := args
-      | throwErrorAt b "Cannot refine {v}, of type {mv_ty}, by recursion"
+      | throwErrorAt b "Cannot refine {v}, of type {holeTy}, by recursion"
     matchConstInduct (inp_ty.getAppFn)
       (fun _ => throwErrorAt v "Cannot refine {v}, of input type {inp_ty}, \
         by recursion (it is not an inductive type)")
       <| fun ival us => do
       let rec_name := mkRecName ival.name
-      let goal_names <- ival.ctors.mapM fun ctor => do
-        getUnusedUserName (ctor.replacePrefix ival.name id)
-      let goals <- elabGive v #[] (keepGoals := true) (mv? := mv?)
+      let goal_names <- ival.ctors.mapM fun ctor =>
+        getUnusedUserName (ctor.replacePrefix ival.name vId)
+      -- TODO: this used to be (mv? := mv?), but I changed it to this because it makes
+      -- more sense. If something breaks, check this.
+      let goals <- elabGive v #[] (keepGoals := true) (mv? := holeMv)
         (goal_names.toArray.map mkIdent)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
       assert! goals.length == goal_names.length
-      -- Register the new patterns
       for (goal, ctor) in goals.zip ival.ctors do
-        let env <- getEnv
-        let some ctor_val := env.find? ctor
-          | throwError "Internal: couldn't find ctor {ctor} in environment"
-        let ctor_ty := ctor_val.instantiateTypeLevelParams us
-        let (cargs, _bs, r) <- forallMetaTelescope ctor_ty
-        if !(<- isDefEq r inp_ty) then
-          throwError f!"The constructor {ctor} yields {r}, not {inp_ty}"
-        -- Drop the parameter arguments, these don't go into the recursor ops
-        let cargs := cargs.drop ival.numParams
-        let mut goal_args := #[]
-        let mut ctor_patt_args := []
-        for carg in cargs do
-          let mv := carg.mvarId!
-          let cty <- mv.getType
-          let tag <- mv.getTag
-          let fresh <- mkFreshUserName tag
-          goal_args := goal_args.push (<- mv.getType, fresh)
-          -- Here, the goal args are just the visible constructor args, so we
-          -- add them to the pattern.
-          ctor_patt_args := ctor_patt_args.concat (.var fresh)
-          -- Then, find the recursive arguments
-          if <- isDefEq cty inp_ty then
-            let recName := fresh.recOf id
-            goal_args := goal_args.push (motive, recName)
-        let ctor_patt := ArgPatt.ctor ctor ctor_patt_args
-        -- And finally, the remaining arguments from the motive
-        let names <- rest_args.mapM fun _ => mkFreshBinderName
-        let rest_named := rest_args.zip names
-        goal_args := goal_args ++ rest_named
-        let rest_patts := rest_named.map fun (_, name) => ArgPatt.var name
-        let mut pattern : Pattern := {
-          fname := id, fmv := rootMv, endpointMv := goal
-          ps := ctor_patt :: rest_patts
-          refine := refineRecursion goal_args goal,
-          transform := transformRecursion
-        }
-        if let some prePatt := prePatt? then
-          pattern := { pattern with
-            ps := prePatt.ps ++ pattern.ps
-            transform ctx
-              := prePatt.transform ctx
-              >=> transformRecursion prePatt.ps ctx
-          }
-        patternsRef.modify fun ps => ps.insert pattern
-    return ()
+        let pattern <- buildCtorPattern vId rootMv inp_ty motive us rest_args ival ctor goal
+        PatternMap.insert (applyPrePatt prePatt? pattern)
+  | `(give_by| aux ($_auxFn:ident : $auxTy:term) $_auxArgs:term*) => do
+    logErrorAt auxTy "Auxiliary function type annotations are not yet supported."
+  | `(give_by| aux $auxId:ident $auxArgs:term*) => do
+    let auxName := auxId.getId
+    let args <- auxArgs.mapM (Tactic.elabTerm · none)
+    let argTys <- args.mapM (inferType ·)
+    let auxTy <- mkArrowN argTys holeTy
+    let auxFn <- mkFreshExprMVar auxTy (userName := auxName)
+    let auxApp <- Term.ensureHasType holeTy (mkAppN auxFn args)
+    let auxMv := auxFn.mvarId!
+    -- Remove from the new hole's local context the variables which are used
+    -- in arguments to the new function.
+    auxMv.modifyLCtx fun lctx => lctx.foldl (init := lctx) fun lctx decl =>
+      if auxApp.hasAnyFVar (· == decl.fvarId) then lctx.erase decl.fvarId
+      else lctx
+    holeMv.assignIfDefEq auxApp
+    logInfo m!"hole = {holeMv} = {Expr.mvar holeMv}"
+    Tactic.appendGoals [auxMv]
   | _ => throwUnsupportedSyntax
 
 syntax (name := blankHole) "blank" ident : term
@@ -716,7 +754,7 @@ def elabGivePattBy
   let mv_ty <- mv.getType''
   let (args, _) := unarrow mv_ty
   let (qs, _mvs) <- mkPatt rest.toList args
-  let (pattern, names) <- findMatch mv rest.toList args (pattRef? := p)
+  let (pattern, names) <- PatternMap.findMatch mv rest.toList args (pattRef? := p)
   let tag <- mkFreshUserName (f.getId.str "body")
   let body <- `(blank $(mkIdent tag))
   let hole <- pattern.refine {
@@ -733,17 +771,15 @@ def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
   := Tactic.withMainContext do
   let some mv := (<- getMCtx).findUserName? v.getId
     | throwErrorAt v "No calculation target found named '{v.getId}'"
-  let ps <- patternsRef.get
-  let mut fmt : MessageData := m!"Available 'give' patterns for {v}:"
-  let mut any := false
-  for pattern in ps do
-    if pattern.fmv != mv then continue
-    let endpoint := pattern.endpointMv
-    if (<- endpoint.isDeclared)
-        && !(<- endpoint.isAssignedOrDelayedAssigned) then
-      fmt := fmt ++ indentD (format pattern)
-      any := true
-  if any then
+  let patts <- allPatterns mv
+  if !patts.isEmpty then
+    let mut fmt : MessageData := m!"Available 'give' patterns for {v}:"
+    for patt in patts do
+      fmt := fmt ++ indentD (format patt)
+    fmt := fmt ++ m!"\n\nOr, use: 'give {v} by ...'"
+    for help in giveByHelp do
+      fmt := fmt ++ indentD m!"... {help}"
+    fmt := fmt ++ "\n"
     logInfo fmt
   else
     logInfo m!"No available 'give' patterns for {v}"
@@ -752,15 +788,15 @@ elab_rules : tactic
   | `(tactic| give $v:ident $args:binderIdent* $mode:give_mode => $tac) =>
     match mode with
     | `(give_mode| as $vs:ident*) =>
-        discard <| elabGive v args vs tac
+        discard <| elabGive v args vs tac (keepGoals := true)
     | `(give_mode| as? $vs:ident*) => Tactic.withMainContext do
-        let res <- elabGive v args vs tac
+        let res <- elabGive v args vs tac (keepGoals := true)
         let names <- res.mapM fun mv => mv.getTag <&> (·.toString)
         logInfoAt mode m!"Generated {res.length} goals: {String.intercalate ", " names}\n\
         To rename them, use:\n  give {v} as x y z ... => {tac}"
     | _ => throwUnsupportedSyntax
   | `(tactic| give $v:ident $args:binderIdent* => $tac) =>
-    discard <| elabGive v args #[] tac
+    discard <| elabGive v args #[] tac (keepGoals := true)
   | `(tactic| give $p:term := $to_term:term) => do
     elabGiveDef p to_term
   | `(tactic| give $v:ident by $b:give_by) => do
@@ -985,18 +1021,22 @@ compile_inductive% Colour
 
 elab "mv_info" v:ident : tactic => withMainContext do
   let mctx <- getMCtx
-  let some mv := mctx.findUserName? v.getId
-    | throwError "unknown mvar"
-  let decl := mctx.getDecl mv
-  logInfo m!"found decl for {v.getId}
-  name: {mv.name}
-  type: {<- mv.getType}
-  expr: {Expr.mvar mv}
-  synthetic? {decl.kind.isSyntheticOpaque}
-  readonly? {<- mv.isReadOnly}
-  declared? {<- mv.isDeclared}
-  delayed?  {<- mv.isDelayedAssigned}
-  assigned? {<- mv.isAssigned}"
+  for (mv, decl) in mctx.decls do
+    if decl.userName = v.getId then
+      logInfo m!"found decl for {v.getId}
+    name: {mv.name}
+    type: {<- mv.getType}
+    expr: {Expr.mvar mv}
+    synthetic? {decl.kind.isSyntheticOpaque}
+    readonly? {<- mv.isReadOnly}
+    declared? {<- mv.isDeclared}
+    delayed?  {<- mv.isDelayedAssigned}
+    assigned? {<- mv.isAssigned}"
+
+elab "dbg_reduce" t:term : tactic => withMainContext do
+  let exp <- withoutErrToSorry <| Term.elabTerm t none
+  let exp' <- reduce exp
+  logInfo m!"{exp}\n --> {exp'}"
 
 structure Eg where
   f : Nat -> Nat
@@ -1023,6 +1063,17 @@ def test_def : Nat := by
   give g x Nat.zero n := x
   give g x (Nat.succ m) n := g x m n
   exact g 10 10 10
+
+def test_aux_def : List Nat := by
+  let rev : List Nat -> List Nat := ?rev
+  -- give rev as fastrev =>
+  --   refine fun xs => (?fastrev : List Nat -> List Nat -> List Nat) xs []
+  give rev xs by aux fastrev xs ([] : List Nat)
+  give fastrev by recursion
+  give? fastrev
+  -- give fastrev [] ys a := ys
+  -- give fastrev (x :: xs) ys := fastrev xs (x :: ys)
+  exact []
 
 -- def eg :
 --     Σ' f : List Nat -> Nat -> List Nat,
