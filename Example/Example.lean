@@ -1,5 +1,7 @@
 import Calculator.Calculator
 import Mathlib.Tactic.Common
+import Mathlib.Data.List.Basic
+import Mathlib.Data.Nat.Basic
 import Mathlib.Util.CompileInductive
 
 open Tactic.Calculation
@@ -165,6 +167,19 @@ def comp_calc : CompSpec := by
           := by define comp (Exp.add x y) c := comp y (comp x (Code.add c))
 
 #print comp_calc
+
+def eg : map (· + 1) ∘ map (· * 2) = map (· * 2 + 1) := by
+  calc
+    (map fun x ↦ x + 1) ∘ map fun x ↦ x * 2
+    _ = map ((fun x ↦ x + 1) ∘ fun x ↦ x * 2)
+        := by simp only [List.map_comp_map]
+    _ = map fun x ↦ x * 2 + 1
+        := by trivial
+
+def seq (n : Nat) : List Nat := match n with
+  | 0 => []
+  | n+1 => 1 :: map .succ (seq n)
+
 
 section Test
 

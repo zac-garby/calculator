@@ -31,6 +31,12 @@ open Lean Meta Elab Tactic
 * If we've partially refined the proof of a step by hand (i.e. written some tactics) but it's
   not closed yet, the suggester still makes suggestions, but they are not applied properly.
 
+* Normal program transformation stuff like fold fusion, as lemmas to apply?
+
+* When I use a tactic like `apply ...`, if it generates just one goal, it should
+  make a step for me to that goal.
+
+* Easy: don't suggest new constructors when the type isn't defined in this file.
 -/
 
 set_option linter.style.multiGoal false

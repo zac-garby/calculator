@@ -29,9 +29,23 @@ elab "todo" : tactic => return ()
 elab "todo" "[" term "]" : tactic => return ()
 def no_proof := "todo"
 
-def calc_name (name : Name) : Name
-  := name
-  where pre := Name.str .anonymous "ℂ"
+/--
+Find a calculation target. This is a metavariable with the given name, but it
+prioritises those which are not yet assigned if there are duplicate names.
+-/
+def findCalcTarget? (name : Name) : MetaM (Option MVarId) := do
+  let mctx <- getMCtx
+  for (mv, decl) in mctx.decls do
+    if decl.userName = name && !(<- mv.isAssigned) then
+      return some mv
+  return mctx.findUserName? name
+
+def findCalcTarget (name : Name) (stxRef : Option Syntax := none)
+  : MetaM MVarId := do
+  match (<- findCalcTarget? name), stxRef with
+  | none, some ref => throwErrorAt ref "No calculation target found named '{name}'"
+  | none, none => throwError "No calculation target found named '{name}'"
+  | some mv, _ => return mv
 
 def match_struct_fields (goal_type : Expr)
   : MetaM (Array Expr × Array (Name × Expr)) := do
@@ -404,11 +418,11 @@ syntax "as"  ident+ : give_mode
 syntax "as?" ident* : give_mode
 
 declare_syntax_cat give_by
-syntax "recursion" : give_by
-syntax "cases" : give_by -- Still use recursor, probably
-syntax "if " Parser.Term.matchDiscr : give_by
-syntax "intro " ident* : give_by
-syntax "aux " term : give_by
+scoped syntax "recursion" : give_by
+scoped syntax "cases" : give_by -- Still use recursor, probably
+scoped syntax "if " Parser.Term.matchDiscr : give_by
+scoped syntax "intro " ident* : give_by
+scoped syntax "aux " term : give_by
 
 private def giveByHelp := [
   "recursion",
@@ -526,15 +540,13 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
   let mctx <- getMCtx
   match p with
   | `($f:ident) => do
-    let (some mv) := mctx.findUserName? f.getId
-      | throwErrorAt f "No calculation target found: '{f.getId}'"
+    let mv <- findCalcTarget f.getId f
     let mv_ty <- mv.getType''
     let to_expr <- Term.elabTerm to_term (some mv_ty)
     -- define_mv f.getId to_expr
     elabGiveExact f.getId to_expr
   | `($f:ident $rest*) => do
-    let (some mv) := mctx.findUserName? f.getId
-      | throwErrorAt f "No calculation target found: '{f.getId}'"
+    let mv <- findCalcTarget f.getId f
     let mv_ty <- mv.getType''
     let (args, _) := unarrow mv_ty
     let (qs, _mvs) <- mkPatt rest.toList args
@@ -563,10 +575,12 @@ private def elabGive
   (keepGoals : Bool := false)
   (mv? : Option MVarId := none)
   : TacticM (List MVarId) := do
-  let id := calc_name v.getId
+  let id := v.getId
   let ids := asIds.toList.map (·.getId)
   let goals <- Tactic.getGoals
   let mut already_goal := true
+  -- TODO: Is this logic correct? That it requires it to be a *goal*,
+  -- as opposed to the other give elaborators which use findCalcTarget
   let some mv <- if let some mv := mv? then do
       -- If the given mv isn't a goal already, then make it one
       let already <- goals.anyM (fun g => return g == mv)
@@ -692,11 +706,10 @@ private def buildCtorPattern
 
 def elabGiveBy (v : Ident) (b : TSyntax `give_by)
   (mv? : Option MVarId := none) (prePatt? : Option Pattern := none)
+  (rootMv? : Option MVarId := none)
   : TacticM Unit := do
-  let mctx <- getMCtx
   let vId := v.getId
-  let some rootMv := mctx.findUserName? vId
-    | throwErrorAt v "Unknown goal called '{vId}'"
+  let rootMv <- findCalcTarget vId v
   let holeMv := mv?.getD rootMv
   let holeTy <- holeMv.getType''
   let (args, _retTy) := unarrow holeTy
@@ -716,7 +729,7 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         getUnusedUserName (ctor.replacePrefix ival.name vId)
       -- TODO: this used to be (mv? := mv?), but I changed it to this because it makes
       -- more sense. If something breaks, check this.
-      let goals <- elabGive v #[] (keepGoals := true) (mv? := holeMv)
+      let goals <- elabGive v #[] (keepGoals := true) (mv? := mv?)
         (goal_names.toArray.map mkIdent)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
       assert! goals.length == goal_names.length
@@ -738,8 +751,23 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
     auxMv.modifyLCtx fun lctx => lctx.foldl (init := lctx) fun lctx decl =>
       if auxApp.hasAnyFVar (· == decl.fvarId) then lctx.erase decl.fvarId
       else lctx
-    holeMv.assignIfDefEq auxApp
-    logInfo m!"hole = {holeMv} = {Expr.mvar holeMv}"
+    -- Build a proper closed lambda for rootMv by abstracting the prePatt fvars.
+    -- This avoids the display issue where `rev := fun xs ↦ ?rev` instead of
+    -- `rev := fun xs ↦ ?fastrev xs []`, which happens because MVarId.intro stores
+    -- `rootMv := fun xs => Expr.mvar holeMv` with xs only accessible via holeMv's
+    -- local context (which is erased from auxMv's context).
+    let prePattVarNames := (prePatt?.map (·.ps) |>.getD []).filterMap fun
+      | .var n => some n | _ => none
+    let prePattFVars <- prePattVarNames.mapM fun n => do
+      let some decl := (← getLCtx).findFromUserName? n
+        | throwError "Internal: pattern var '{n}' not found in aux context"
+      return decl.fvarId
+    let lambda <- mkLambdaFVars (prePattFVars.map .fvar).toArray auxApp
+    -- Use rootMv? (the pre-refineTakeArgs mvar) to assign the closed lambda.
+    -- rootMv from findUserName? may be the inner mvar (after intro), which has wrong type.
+    let trueRootMv := rootMv?.getD rootMv
+    trueRootMv.eraseAssignment
+    trueRootMv.assign lambda
     Tactic.appendGoals [auxMv]
   | _ => throwUnsupportedSyntax
 
@@ -748,9 +776,7 @@ syntax (name := blankHole) "blank" ident : term
 def elabGivePattBy
   (p : Term) (f : Ident) (rest : TSyntaxArray `term) (b : TSyntax `give_by)
   : TacticM Unit := Tactic.withMainContext do
-  let mctx <- getMCtx
-  let (some mv) := mctx.findUserName? f.getId
-    | throwErrorAt f "No calculation target found: '{f.getId}'"
+  let mv <- findCalcTarget f.getId f
   let mv_ty <- mv.getType''
   let (args, _) := unarrow mv_ty
   let (qs, _mvs) <- mkPatt rest.toList args
@@ -764,13 +790,12 @@ def elabGivePattBy
     let mut tempLCtx <- getLCtx
     tempLCtx := subSimul (names.map fun _ (new, _) => new) tempLCtx
     withLCtx' tempLCtx do
-      elabGiveBy f b (prePatt? := pattern) (mv? := hole)
+      elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
   return ()
 
 def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
   := Tactic.withMainContext do
-  let some mv := (<- getMCtx).findUserName? v.getId
-    | throwErrorAt v "No calculation target found named '{v.getId}'"
+  let mv <- findCalcTarget v.getId v
   let patts <- allPatterns mv
   if !patts.isEmpty then
     let mut fmt : MessageData := m!"Available 'give' patterns for {v}:"
@@ -825,7 +850,7 @@ def calc_intro_other (as_name : Name) (field_ty : Expr)
   : TacticM (Expr × FVarId) := do
   let field_body <- Tactic.withMainContext do
     mkFreshExprMVar (some field_ty) (kind := .syntheticOpaque)
-  field_body.mvarId!.setUserName (calc_name as_name)
+  field_body.mvarId!.setUserName as_name
   let fv <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
   Tactic.appendGoals [field_body.mvarId!]
   return (field_body, fv)
@@ -842,19 +867,6 @@ def calc_intro_for (field_name : Name) (fields : Array (Name × Expr)) (as_name 
 declare_syntax_cat calc_name
 syntax ident : calc_name
 syntax ident "as" ident : calc_name
-
-elab (name := collectTac)
-  "collect " body:tacticSeq : tactic =>
-  Tactic.withMainContext do
-  patternsRef.set {}
-  -- let target <- Tactic.getMainTarget
-  Tactic.evalTactic body
-  -- Unsure if I still need this...
-  -- let mctx <- getMCtx
-  -- for (mv, decl) in mctx.decls do
-  --   if !decl.userName.isAnonymous &&
-  --      !(<- mv.isAssignedOrDelayedAssigned) then
-  --     Tactic.pushGoal mv
 
 /--
 Introduce a calculation for the current goal.
@@ -874,7 +886,9 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
   let main_type <- main_goal.getType''
   let (_, spec_fields) <- match_struct_fields main_type
   if vs.getElems.size == 0 then
-    logWarning f!"Use `calculate` followed by any of {spec_fields.toList.map fun (n, _) => n}"
+    let possible := spec_fields.toList.map (m!"{·.fst}")
+    logWarning m!"Possible calculation targets:\
+    {indentD <| MessageData.joinSep possible ", "}\n"
   -- for each ident 'v' listed:
   let vals <- vs.getElems.mapM fun s => withRef s do
     match s with
@@ -899,8 +913,20 @@ elab (name := calculateTactic) "calculate " vs:calc_name,* : tactic => Tactic.wi
     let some field_mv <- field_mvs.findM? fun u => u.getTag <&> (· == field_name)
       | throwErrorAt stx "bug: unknown field name: {field_name}"
     field_mv.assign mv_val
-    field_mv.setUserName (calc_name as_name)
+    field_mv.setUserName as_name
+  for (_, as_name, _) in vals do
+    Tactic.evalTactic (<- `(tactic| refold $(mkIdent as_name)))
 
+/- TODO:
+Support this more generally, so we could write:
+
+  calculate f : Int -> Int, foo, bar
+
+then foo and bar are fields from the goal type, but f is a new thing,
+equivalent to writing:
+
+  let f : Int -> Int := ?f
+-/
 @[inherit_doc calculateTactic]
 elab (name := calculateGoal) "calculate" "⊢" "as" r:ident : tactic => Tactic.withMainContext do
   let main_goal <- Tactic.getMainGoal
@@ -937,6 +963,21 @@ elab "unpkg" : tactic => Tactic.withMainContext do
   let (fv, mv') <- mv.intro un
   Tactic.replaceMainGoal [mv']
   splitHyp fv
+
+-- TODO: May not need this anymore.
+-- TODO: Or, keep it, and auto-instantiate remaining with 'default'
+elab (name := collectTac)
+  "collect " body:tacticSeq : tactic =>
+  Tactic.withMainContext do
+  patternsRef.set {}
+  -- let target <- Tactic.getMainTarget
+  Tactic.evalTactic body
+  -- Unsure if I still need this...
+  -- let mctx <- getMCtx
+  -- for (mv, decl) in mctx.decls do
+  --   if !decl.userName.isAnonymous &&
+  --      !(<- mv.isAssignedOrDelayedAssigned) then
+  --     Tactic.pushGoal mv
 
 local infixl: 50 " <;> " => Tactic.andThenOnSubgoals
 
@@ -1038,11 +1079,6 @@ elab "dbg_reduce" t:term : tactic => withMainContext do
   let exp' <- reduce exp
   logInfo m!"{exp}\n --> {exp'}"
 
-structure Eg where
-  f : Nat -> Nat
-  g : Colour -> Int
-  correct : ∀ n, f n <= n
-
 @[term_elab blankHole]
 def elabQ : TermElab := fun stx typ? => match stx with
   | `(blank $v:ident) => do
@@ -1053,16 +1089,15 @@ def elabQ : TermElab := fun stx typ? => match stx with
     return mv_expr
   | _ => throwUnsupportedSyntax
 
-def test_def : Nat := by
-  let f : List Nat -> Nat -> Nat := ?f
-  give f by recursion
-  give f (u :: us) head := u + f us head
-  give f [] n := n
-  let g : Nat -> Nat -> Nat -> Nat := ?g
-  give g n by recursion
-  give g x Nat.zero n := x
-  give g x (Nat.succ m) n := g x m n
-  exact g 10 10 10
+structure Eg where
+  f : Nat -> Nat
+  g : Colour -> Int
+  correct : ∀ n, f n <= n
+
+def test_def : Eg := by
+  calculate f, g
+  give f x := 0
+  give g by cases
 
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?rev
@@ -1070,9 +1105,8 @@ def test_aux_def : List Nat := by
   --   refine fun xs => (?fastrev : List Nat -> List Nat -> List Nat) xs []
   give rev xs by aux fastrev xs ([] : List Nat)
   give fastrev by recursion
-  give? fastrev
-  -- give fastrev [] ys a := ys
-  -- give fastrev (x :: xs) ys := fastrev xs (x :: ys)
+  give fastrev [] ys := ys
+  give fastrev (x :: xs) ys := fastrev xs (x :: ys)
   exact []
 
 -- def eg :

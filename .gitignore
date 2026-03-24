@@ -2,3 +2,5 @@
 metrics.pdf
 .DS_Store
 .gitignore
+Example/Test.lean
+calculator.code-workspace

@@ -553,7 +553,7 @@ for a single result. This means `replace` may safely reference free variables in
 by enclosing binders (e.g. the `v` from `∃ v, ...`). -/
 private def replaceSubexprMulti
     (replace : Expr → MetaM (List Expr)) (p : SubExpr.Pos) (root : Expr) : MetaM (List Expr) :=
-  aux replace p.toArray.toList root
+  go replace p.toArray.toList root
 where
   coord (g : Expr → MetaM (List Expr)) (n : Nat) (e : Expr) : MetaM (List Expr) := do
     match n, e with
@@ -573,9 +573,9 @@ where
     | n, .mdata _ a        => return (← coord g n a).map e.updateMData!
     | 3, _                 => throwError "Lensing on types is not supported"
     | c, e                 => throwError "Invalid coordinate {c} for {e}"
-  aux (g : Expr → MetaM (List Expr)) : List Nat → Expr → MetaM (List Expr)
+  go (g : Expr → MetaM (List Expr)) : List Nat → Expr → MetaM (List Expr)
     | [],            e => g e
-    | head :: tail, e => coord (aux g tail) head e
+    | head :: tail, e => coord (go g tail) head e
 
 @[suggest]
 def suggest_restructuring : CalcSuggester := fun goal _doc _params _lhs _rhs => do
