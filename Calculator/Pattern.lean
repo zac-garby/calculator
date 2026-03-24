@@ -19,10 +19,10 @@ inductive ArgPatt where
 
 private partial def argPattEq (p q : ArgPatt) : Bool := match p, q with
   | .var _a, .var _b => true
-  | .ctor pc pargs, .ctor qc qargs =>
-    pc == qc && (pargs.zip qargs |>.all (Function.uncurry argPattEq))
-  | .bind pn pv, .bind qn qv =>
-    argPattEq pn qn && argPattEq pv qv
+  | .ctor pc pargs, .ctor qc qargs
+    => pc == qc && (pargs.zip qargs |>.all (Function.uncurry argPattEq))
+  | .bind pn pv, .bind qn qv
+    => argPattEq pn qn && argPattEq pv qv
   | _, _ => false
 
 private def argPattHash (p : ArgPatt) : UInt64 := match p with

@@ -37,6 +37,9 @@ open Lean Meta Elab Tactic
   make a step for me to that goal.
 
 * Easy: don't suggest new constructors when the type isn't defined in this file.
+
+* Syntax to introduce custom patterns with `give =>` like
+  `give fastrev as [], (x :: xs) => apply List.rec`
 -/
 
 set_option linter.style.multiGoal false

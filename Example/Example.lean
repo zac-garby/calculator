@@ -17,7 +17,7 @@ structure RevSpec a : Type where
 
 def revCalc {a} : RevSpec a := by
   calculate fastrev
-  give fastrev => apply List.rec
+  give fastrev by recursion
   intro xs
   induction xs <;> intro ys
   case nil => calc
@@ -136,8 +136,8 @@ structure CompSpec where
 
 def comp_calc : CompSpec := by
   calculate comp, exec
-  give comp => apply Exp.rec
-  give exec => apply Code.rec
+  give comp by recursion
+  give exec by recursion
   intro e
   induction e <;> intros c s
   -- Case val n:
@@ -183,15 +183,15 @@ def seq (n : Nat) : List Nat := match n with
 
 section Test
 
-open Lean Elab Lean.PrettyPrinter Delaborator
+-- open Lean Elab Lean.PrettyPrinter Delaborator
 
-syntax (name := myWith) "with " (ident " := " term),* "; " term : term
-@[term_elab myWith]
-def with_elab : Term.TermElab := fun stx ty => match stx with
-  | `(with $[$ns:ident := $vs:term],*; $body) => do
-    let stx <- ns.zip vs |>.foldlM (fun s (n, v) => `(let $n := $v; $(.mk s))) body
-    Term.elabTerm stx ty
-  | _ => throwUnsupportedSyntax
+-- syntax (name := myWith) "with " (ident " := " term),* "; " term : term
+-- @[term_elab myWith]
+-- def with_elab : Term.TermElab := fun stx ty => match stx with
+--   | `(with $[$ns:ident := $vs:term],*; $body) => do
+--     let stx <- ns.zip vs |>.foldlM (fun s (n, v) => `(let $n := $v; $(.mk s))) body
+--     Term.elabTerm stx ty
+--   | _ => throwUnsupportedSyntax
 
 -- @[delab letE]
 -- def delab_let : Delab := do
