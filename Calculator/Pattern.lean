@@ -113,14 +113,17 @@ partial def Patt.matchPatt
     | .var pn, .var qn => do
       modify fun ns => ns.insert pn qn
     | .ctor pc (pargs : Patt), .ctor qc qargs => do
-      if pc ≠ qc then return false
+      -- Either may be partially qualified; use suffix matching in both directions
+      if pc != qc && !qc.isSuffixOf pc && !pc.isSuffixOf qc then return false
       if !(<- pargs.matchPatt qargs) then
         return false
     | .ctor pc [], .var qn =>
-      if pc.eraseMacroScopes != qn.eraseMacroScopes then
+      -- qn may be partially qualified (e.g. `Colour.Red`) while pc is fully qualified
+      -- (e.g. `Tactic.Calculation.Colour.Red`). Use suffix matching.
+      if !qn.eraseMacroScopes.isSuffixOf pc.eraseMacroScopes then
         return false
     | .var pn, .ctor qc [] =>
-      if pn.eraseMacroScopes != qc.eraseMacroScopes then
+      if !pn.eraseMacroScopes.isSuffixOf qc.eraseMacroScopes then
         return false
     | _, _ => return false
   return true
@@ -196,6 +199,9 @@ private def refineTakeArgs
   let mut goal := goal
   for old in names do
     let (_fv, goal') <- goal.intro old
+    -- Clear userName so the new mvar doesn't collide with the parent's userName
+    -- in findCalcTarget lookups (MVarId.intro inherits the parent's userName).
+    goal'.setUserName .anonymous
     goal := goal'
   return goal
 

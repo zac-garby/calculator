@@ -714,7 +714,7 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
   (rootMv? : Option MVarId := none)
   : TacticM Unit := do
   let vId := v.getId
-  let rootMv <- findCalcTarget vId v
+  let rootMv <- rootMv?.getDM (findCalcTarget vId v)
   let holeMv := mv?.getD rootMv
   let holeTy <- holeMv.getType''
   let (args, _retTy) := unarrow holeTy
@@ -1164,7 +1164,10 @@ structure Eg where
 
 def test_def : Eg := by
   calculate f, g
-  give g := fun c => 0
+  give g c by cases of c
+  give g Colour.Red := 1
+  give g Colour.Blue := 2
+  give g Colour.Green := 3
   give f n := n
   grind
 
