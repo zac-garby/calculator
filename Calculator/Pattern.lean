@@ -37,6 +37,13 @@ def ArgPatt.isVar (p : ArgPatt) : Bool := match p with
   | var _ => true
   | _ => false
 
+/-- Replace all occurrences of `.var varName` with `replacement` in a pattern. -/
+partial def ArgPatt.replace (varName : Name) (replacement : ArgPatt) : ArgPatt → ArgPatt
+  | .var n => if n == varName then replacement else .var n
+  | .ctor c args => .ctor c (args.map (ArgPatt.replace varName replacement))
+  | .bind n v => .bind (ArgPatt.replace varName replacement n)
+                       (ArgPatt.replace varName replacement v)
+
 abbrev Patt := List ArgPatt
 
 private def fmtPatt : (p : ArgPatt) -> Format

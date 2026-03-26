@@ -421,17 +421,17 @@ syntax "as?" ident* : give_mode
 
 declare_syntax_cat give_by
 scoped syntax "recursion" : give_by
-scoped syntax "cases" : give_by -- Still use recursor, probably
+scoped syntax "cases" "of" term : give_by
 scoped syntax "if " Parser.Term.matchDiscr : give_by
-scoped syntax "intro " ident* : give_by
+-- scoped syntax "intro " ident* : give_by
 scoped syntax "aux " term : give_by
 
 private def giveByHelp := [
   "recursion",
-  "cases",
+  "cases of x",
   "if P",
   "if h : P",
-  "intro x y z ⋯",
+  -- "intro x y z ⋯",
   "aux f x y z ⋯"
 ]
 
@@ -632,7 +632,8 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
       let arg_name := arg_id.getId
       let some (old_name, new_name, _) := ctx.names.toList
         |>.find? (fun (_, n, _) => n == arg_name)
-        | throwErrorAt arg0 "Can't make recursive call on {arg0}"
+        | throwErrorAt arg0 "Can't make recursive call on {arg0}\n\
+          Names: {ctx.names.toList.map fun (k, v, _) => (k, v)}"
       let old_rec_name := old_name.recOf f.getId
       let new_rec_name := new_name.recOf f.getId
       if let some _recur := (<- getLCtx).findFromUserName? old_rec_name then
@@ -678,6 +679,7 @@ private def buildCtorPattern
   -- Drop the parameter arguments, these don't go into the recursor ops
   let cargs := cargs.drop ival.numParams
   let mut goal_args := #[]
+  let mut ih_args := #[]
   let mut ctor_patt_args := []
   for carg in cargs do
     let mv := carg.mvarId!
@@ -688,10 +690,12 @@ private def buildCtorPattern
     -- Here, the goal args are just the visible constructor args, so we
     -- add them to the pattern.
     ctor_patt_args := ctor_patt_args.concat (.var fresh)
-    -- Then, find the recursive arguments
+    -- Then, find the recursive arguments (IHs come after all ctor args
+    -- in Lean's recursor, so we collect them separately)
     if <- isDefEq cty inp_ty then
       let recName := fresh.recOf id
-      goal_args := goal_args.push (motive, recName)
+      ih_args := ih_args.push (motive, recName)
+  goal_args := goal_args ++ ih_args
   let ctor_patt := ArgPatt.ctor ctor ctor_patt_args
   -- And finally, the remaining arguments from the motive
   let names <- rest_args.mapM fun _ => mkFreshBinderName
@@ -738,28 +742,62 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         let pattern <- buildCtorPattern vId rootMv inp_ty motive us rest_args ival ctor goal
         let pattern := applyPrePatt prePatt? pattern
         PatternMap.insert pattern
-  | `(give_by| cases) => do
-    let some (_, motive) := holeTy.arrow?
-      | throwErrorAt v "Cannot refine {v}, of type {holeTy}, by recursion \
-        (it is not a function type)"
-    let (inp_ty :: rest_args) := args
-      | throwErrorAt b "Cannot refine {v}, of type {holeTy}, by recursion"
-    matchConstInduct (inp_ty.getAppFn)
-      (fun _ => throwErrorAt v "Cannot refine {v}, of input type {inp_ty}, \
-        by recursion (it is not an inductive type)")
-      <| fun ival us => do
-      let rec_name := mkRecName ival.name
-      let goal_names <- ival.ctors.mapM fun ctor =>
-        getUnusedUserName (ctor.replacePrefix ival.name vId)
-      -- TODO: this used to be (mv? := mv?), but I changed it to this because it makes
-      -- more sense. If something breaks, check this.
-      let goals <- elabGive v #[] (keepGoals := true) (mv? := mv?)
-        (goal_names.toArray.map mkIdent)
-        (<- `(tacticSeq| apply $(mkIdent rec_name)))
-      assert! goals.length == goal_names.length
-      for (goal, ctor) in goals.zip ival.ctors do
-        let pattern <- buildCtorPattern vId rootMv inp_ty motive us rest_args ival ctor goal
-        PatternMap.insert (applyPrePatt prePatt? pattern)
+  | `(give_by| cases of $argTerm:term) => do
+    let `($argId:ident) := argTerm
+      | throwErrorAt argTerm "Expected an identifier after 'cases of'"
+    let argName := argId.getId
+    -- getLCtx returns the renamed context (due to withLCtx' in elabGivePattBy)
+    let renamedLCtx <- getLCtx
+    let some argDecl := renamedLCtx.findFromUserName? argName
+      | throwErrorAt argTerm "'{argName}' not found in context. \
+          Use 'give {v} patt by cases of {argName}' after a pattern that binds {argName}."
+    let argFVarId := argDecl.fvarId
+    -- Get the original (pre-rename) name of this fvar from the hole's stored lctx.
+    -- prePatt.ps uses these original names, not the user-renamed ones.
+    let origArgName : Name <- holeMv.withContext do
+      let some decl := (← getLCtx).find? argFVarId
+        | throwError "Internal: arg fvar '{argName}' not in hole's lctx"
+      return decl.userName
+    let argTy <- whnf (<- inferType (.fvar argFVarId))
+    matchConstInduct argTy.getAppFn
+      (fun _ => throwErrorAt argTerm
+        "Cannot case-split on '{argName}': type {argTy} is not an inductive type")
+      <| fun ival _us => do
+    -- Apply cases directly via MVarId.cases using the fvarId
+    -- (bypasses the name-lookup issue in the renamed lctx)
+    let casesSubgoals <- holeMv.cases argFVarId
+    -- Name the goals after constructors (like elabGive does)
+    for subgoal in casesSubgoals do
+      let some ctorName := subgoal.ctorName
+        | continue  -- skip catch-all
+      let goalName <- getUnusedUserName (ctorName.replacePrefix ival.name vId)
+      subgoal.mvarId.setUserName goalName
+      subgoal.mvarId.setKind .syntheticOpaque
+    -- Build a Pattern for each constructor case
+    for subgoal in casesSubgoals do
+      let some ctorName := subgoal.ctorName | continue
+      -- fields are the new constructor arg fvars introduced in this subgoal
+      let fieldNames <- subgoal.fields.toList.mapM fun fieldExpr =>
+        subgoal.mvarId.withContext do
+          let some decl := (← getLCtx).find? fieldExpr.fvarId!
+            | throwError "Internal: case field fvar not found"
+          return decl.userName
+      let ctorPatt := ArgPatt.ctor ctorName (fieldNames.map ArgPatt.var)
+      -- Replace the split variable's position in prePatt.ps with ctorPatt.
+      -- This handles both top-level and nested positions (e.g. chained splits).
+      let ps := match prePatt? with
+        | none => [ctorPatt]
+        | some prePatt => prePatt.ps.map (ArgPatt.replace origArgName ctorPatt)
+      let transform : Transformer := prePatt?.map (·.transform) |>.getD default
+      let pattern : Pattern := {
+        fname := vId, fmv := rootMv, endpointMv := subgoal.mvarId
+        ps
+        refine := fun _ => return subgoal.mvarId
+        transform
+      }
+      PatternMap.insert pattern
+    -- Expose the new goals to the proof state
+    Tactic.appendGoals (casesSubgoals.toList.map (·.mvarId))
   | `(give_by| aux ($_auxFn:ident : $auxTy:term) $_auxArgs:term*) => do
     logErrorAt auxTy "Auxiliary function type annotations are not yet supported."
   | `(give_by| aux $auxId:ident $auxArgs:term*) => do
@@ -1204,39 +1242,129 @@ def test_aux_def : List Nat := by
 --     induction n
 --     all_goals grind
 
--- @[simp]
--- def rev {a} : List a → List a
---   | [] => []
---   | x :: xs => rev xs ++ [x]
+@[simp]
+private def rev {a} : List a → List a
+  | [] => []
+  | x :: xs => rev xs ++ [x]
 
--- structure RevSpec a : Type where
---   fastrev : List a -> List a -> List a
---   correct : ∀ xs ys, rev xs ++ ys = fastrev xs ys
+private structure RevSpec a : Type where
+  fastrev : List a -> List a -> List a
+  correct : ∀ xs ys, rev xs ++ ys = fastrev xs ys
 
--- def revCalc {a} : RevSpec a := by
---   calculate fastrev
---   give fastrev by recursion
---   intro xs
---   (induction xs) <;> intro ys
---   case nil => calc
---     rev [] ++ ys
---     _ = ys
---         := by rfl
---     _ = fastrev [] ys
---         := by give fastrev [] ys := ys
---   case cons x xs ih => calc
---     rev (x :: xs) ++ ys
---     _ = rev xs ++ [x] ++ ys
---         := by rfl
---     _ = rev xs ++ ([x] ++ ys)
---         := by simp only [List.append_assoc]
---     _ = fastrev xs ([x] ++ ys)
---         := by rw [ih]
---     _ = fastrev xs (x :: ys)
---         := by rfl
---     _ = fastrev (x :: xs) ys
---         := by give fastrev (x :: xs) ys := fastrev xs (x :: ys)
+def revCalc {a} : RevSpec a := by
+  calculate fastrev
+  give fastrev by recursion
+  intro xs
+  (induction xs) <;> intro ys
+  case nil => calc
+    rev [] ++ ys
+    _ = ys
+        := by rfl
+    _ = fastrev [] ys
+        := by give fastrev [] ys := ys
+  case cons x xs ih => calc
+    rev (x :: xs) ++ ys
+    _ = rev xs ++ [x] ++ ys
+        := by rfl
+    _ = rev xs ++ ([x] ++ ys)
+        := by simp only [List.append_assoc]
+    _ = fastrev xs ([x] ++ ys)
+        := by rw [ih]
+    _ = fastrev xs (x :: ys)
+        := by rfl
+    _ = fastrev (x :: xs) ys
+        := by give fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
--- def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
+def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
+
+inductive Exp' : Type
+  | val : Nat -> Exp'
+  | add : Exp' -> Exp' -> Exp'
+  deriving BEq
+
+@[simp]
+def eval' : Exp' -> Nat
+  | .val n => n
+  | .add x y => eval' x + eval' y
+
+inductive Code' where
+  | push : ℕ → Code' → Code'
+  | add : Code' → Code'
+
+abbrev Stack' := List Nat
+
+compile_inductive% Exp'
+compile_inductive% Code'
+open Exp' Code'
+
+structure CompSpec' where
+  comp : Exp' -> Code' -> Code'
+  exec : Code' -> Stack' -> Stack'
+  correct : ∀ e c s, exec c (eval' e :: s) = exec (comp e c) s
+
+def comp_calc' : CompSpec' := by
+  calculate comp, exec
+  give comp by recursion
+  give exec by recursion
+  intro e
+  (induction e) <;> intros c s
+  case val n =>
+    calc
+      exec c (eval' (Exp'.val n) :: s)
+      _ = exec c (n :: s) := by rfl
+      _ = exec (Code'.push n c) s
+        := by give exec (Code'.push n c) s := exec c (n :: s)
+      _ = exec (comp (Exp'.val n) c) s
+        := by give comp (Exp'.val n) c := Code'.push n c
+  case add x y ih_x ih_y =>
+    calc
+      exec c (eval' (Exp'.add x y) :: s)
+      _ = exec c ((eval' x + eval' y) :: s) := by rfl
+      _ = let u_1 := eval' y; let u := eval' x;
+          exec c ((u + u_1) :: s) := by rfl
+      _ = let u_1 := eval' y; let u := eval' x;
+          exec (Code'.add c) (u :: u_1 :: s)
+          := by define exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
+      _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
+      _ = exec (comp x (Code'.add c)) (eval' y :: s)
+          := by simp only [ih_x]
+      _ = exec (comp y (comp x (Code'.add c))) s
+          := by simp only [ih_y]
+      _ = exec (comp (Exp'.add x y) c) s
+          := by give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
+
+#print comp_calc'
+
+-- Test: give by cases of
+def comp_calc'' : CompSpec' := by
+  calculate comp, exec
+  give comp by recursion
+  give exec by recursion
+  -- Case-split the stack argument of exec.add, then fill the real case
+  give exec (Code'.add c) s by cases of s
+  give exec (Code'.add c) (u :: s) by cases of s
+  give exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
+  give comp (Exp'.val n) c := Code'.push n c
+  give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
+  give exec (Code'.push n c) s := exec c (n :: s)
+  -- Fill unused exec.add cases (nil and singleton stack)
+  all_goals (try exact default)
+  -- Correctness proof
+  intro e
+  (induction e) <;> intros c s
+  case val n => rfl
+  case add x y ih_x ih_y =>
+    calc
+      exec c (eval' (Exp'.add x y) :: s)
+      _ = exec c ((eval' x + eval' y) :: s) := by rfl
+      _ = let u_1 := eval' y; let u := eval' x; exec c ((u + u_1) :: s) := by rfl
+      _ = let u_1 := eval' y; let u := eval' x;
+          exec (Code'.add c) (u :: u_1 :: s) := by rfl
+      _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
+      _ = exec (comp x (Code'.add c)) (eval' y :: s) := by simp only [ih_x]
+      _ = exec (comp y (comp x (Code'.add c))) s := by simp only [ih_y]
+      _ = exec (comp (Exp'.add x y) c) s := by rfl
+
+#print comp_calc''
 
 end Tactic.Calculation
