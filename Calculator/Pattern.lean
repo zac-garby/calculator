@@ -68,6 +68,13 @@ abbrev NameMap a := Std.HashMap Name a
 partial def mkArgPatt (stx : Term) (typ? : Option Expr)
   : StateT (NameMap MVarId) Tactic.TacticM (ArgPatt × Expr) := withRef stx do
   let stx <- (liftMacroM <| expandMacros stx : Tactic.TacticM Syntax)
+  -- Named argument: (h := true) / (h := false) — branch selector syntax.
+  -- namedArgument node layout: #[atom "(", ident, atom ":=", term, atom ")"]
+  if stx.getKind == `Lean.Parser.Term.namedArgument then
+    let name : TSyntax `ident := ⟨stx[1]!⟩
+    let val : Term := ⟨stx[3]!⟩
+    let (valPatt, valExpr) <- mkArgPatt val none
+    return (.bind (.var name.getId) valPatt, valExpr)
   match stx with
   | `($i:ident) => do
     let name := i.getId
@@ -104,29 +111,32 @@ def mkPatt (args : List Term) (typs : List Expr)
     return q
   m.run default
 
-partial def Patt.matchPatt
-  (ps qs : Patt)
-  : StateT (NameMap Name) Tactic.TacticM Bool := do
-  if ps.length ≠ qs.length then return false
-  for (p, q) in ps.zip qs do
-    match p, q with
-    | .var pn, .var qn => do
-      modify fun ns => ns.insert pn qn
-    | .ctor pc (pargs : Patt), .ctor qc qargs => do
-      -- Either may be partially qualified; use suffix matching in both directions
-      if pc != qc && !qc.isSuffixOf pc && !pc.isSuffixOf qc then return false
-      if !(<- pargs.matchPatt qargs) then
-        return false
-    | .ctor pc [], .var qn =>
-      -- qn may be partially qualified (e.g. `Colour.Red`) while pc is fully qualified
-      -- (e.g. `Tactic.Calculation.Colour.Red`). Use suffix matching.
-      if !qn.eraseMacroScopes.isSuffixOf pc.eraseMacroScopes then
-        return false
-    | .var pn, .ctor qc [] =>
-      if !pn.eraseMacroScopes.isSuffixOf qc.eraseMacroScopes then
-        return false
-    | _, _ => return false
-  return true
+mutual
+partial def ArgPatt.match (p q : ArgPatt)
+  : OptionT (StateM (NameMap Name)) Unit := do
+  match p, q with
+  | .var pn, .var qn =>
+    modify fun ns => ns.insert pn qn
+  | .ctor pc (pargs : Patt), .ctor qc qargs =>
+    -- Either may be partially qualified; use suffix matching in both directions
+    guard (pc == qc || qc.isSuffixOf pc || pc.isSuffixOf qc)
+    pargs.matchPatt qargs
+  | .ctor pc [], .var qn =>
+    -- qn may be partially qualified (e.g. `Colour.Red`) while pc is fully qualified
+    -- (e.g. `Tactic.Calculation.Colour.Red`). Use suffix matching.
+    guard (qn.eraseMacroScopes.isSuffixOf pc.eraseMacroScopes)
+  | .var pn, .ctor qc [] =>
+    guard (pn.eraseMacroScopes.isSuffixOf qc.eraseMacroScopes)
+  | .bind pn pv, .bind qn qv =>
+    pn.match qn
+    pv.match qv
+  | _, _ => failure
+
+partial def Patt.matchPatt (ps qs : Patt)
+  : OptionT (StateM (NameMap Name)) Unit := do
+  guard (ps.length == qs.length)
+  _ <- ps.zipWithM (·.match) qs
+end
 
 /--
 Match a list of arguments (term syntax nodes) against a pattern, to extract a mapping
@@ -134,12 +144,13 @@ from names in the pattern `ps` to names in the arguments, and their types.
 -/
 partial def Patt.match (ps qs : Patt) (mvs : NameMap MVarId)
   : Tactic.TacticM (Option (NameMap (Name × Expr))) := do
-  let (did?, names) <- (ps.matchPatt qs).run default
-  if did? then
-    let both <- names.toList.mapM fun (pn, qn) => do
-      let mv := mvs.get! qn
-      let ty <- mv.getType
-      return (pn, qn, ty)
+  if let (some (), names) := (ps.matchPatt qs).run default then
+    let both <- names.toList.filterMapM fun (pn, qn) => do
+      if let some mv := mvs.get? qn then
+        let ty <- mv.getType
+        return some (pn, qn, ty)
+      else
+        return none
     return .some (.ofList both)
   else
     return none
@@ -180,9 +191,10 @@ instance : BEq Pattern where
   beq p q := p.fname == q.fname
     && p.ps == q.ps
     && p.fmv == q.fmv
+    && p.endpointMv == q.endpointMv
 
 instance : Hashable Pattern where
-  hash p := hash (p.fmv, p.fname, p.ps)
+  hash p := hash (p.fmv, p.fname, p.ps, p.endpointMv)
 
 abbrev PatternMap := Std.HashSet Pattern
 
@@ -191,6 +203,11 @@ initialize
 
 def PatternMap.insert (pattern : Pattern) : MetaM Unit := do
   patternsRef.modify fun (pm : Std.HashSet _) => pm.insert pattern
+    -- Erase before insert so that re-elaboration (which resets mvar ID counters and
+  -- may produce the same (fname, ps, fmv) triple) replaces the stale entry rather
+  -- than leaving the old one with a dead endpointMv in the map.
+  -- patternsRef.modify fun (pm : Std.HashSet _) =>
+  --   (pm.erase pattern).insert pattern
 
 private def refineTakeArgs
   (names : List Name)
@@ -204,6 +221,49 @@ private def refineTakeArgs
     goal'.setUserName .anonymous
     goal := goal'
   return goal
+
+-- let mut goal := goal
+--   let tag <- goal.getTag
+--   let (argTys, retTy) <- goal.getType <&> unarrow
+--   let (args, argTys') := names.zipLeft' argTys
+--   let retTy' <- mkArrowN argTys'.toArray retTy
+--   let (fn, hole) <- goal.withContext <| do
+--     let body <- mkFreshExprMVar retTy' (userName := tag.str "body")
+--     let mut hole := body.mvarId!
+--     let fvs <- args.mapM fun (name, ty) => do
+--       let some ty := ty | throwError "Too many arguments given!"
+--       let fv <- hole.withContext <|
+--         mkFreshExprMVar ty (userName := name)
+--       -- let hole' <- hole.define name ty fv
+--       -- logInfo m!"hole' = {hole'}"
+--       hole.modifyLCtx fun lctx => lctx.mkLocalDecl fv.fvarId! name ty
+--       pure fv
+--     -- for (name, fv) in names.zip fvs do
+--     --   let (fv', hole') <- hole.let name fv
+--     --   hole := hole'
+
+--     -- let mut fvs' := #[]
+--     --   fvs' := fvs'.push (.fvar fv')
+--     -- logInfo m!"make fn from {fvs'} and {hole}"
+--     let fn <- mkLambdaFVars fvs.toArray (.mvar hole)
+--     logInfo m!"fn = {fn}"
+--     logInfo s!"fn = {fn}"
+--     return (fn, hole)
+--   goal.assign fn
+--   return hole
+--   -- for old in names do
+--   --   let (_fv, goal') <- goal.intro old
+--   --   -- Clear userName so the new mvar doesn't collide with the parent's userName
+--   --   -- in findCalcTarget lookups (MVarId.intro inherits the parent's userName).
+--   --   let tag <- goal'.getTag
+--   --   goal'.setUserName (tag ++ old)
+--   --   do
+--   --     logInfo m!"intro'd {old} in goal \
+--   --     (= {Expr.mvar goal}) assigned?{<- goal.isAssigned}:\n{goal}\n  \
+--   --     to goal' (= {Expr.mvar goal'}) assigned?{<- goal'.isAssigned}:\n{goal'}\n  \
+--   --   we have fv: {_fv.name}"
+--   --   goal := goal'
+--   -- return goal
 
 private def mkTakeArgsPattern (fmv : MVarId) (names? : Option (List Name) := none)
   : MetaM (Option Pattern) := do
@@ -231,6 +291,12 @@ def PatternMap.find?
     if patt.ps.length == qs.length then
       if let some names <- patt.ps.match qs mvs then
         return some (patt, names)
+        -- Skip stale entries whose endpoint has already been assigned or is no longer declared
+    -- (mirrors the check in allPatterns, guards against leftover entries from prior elaborations)
+    -- if !(<- patt.endpointMv.isDeclared) || (<- patt.endpointMv.isAssignedOrDelayedAssigned) then
+    --   continue
+    -- if let some names <- patt.ps.match qs mvs then
+    --   return some (patt, names)
   if qs.all (·.isVar) then
     let some names <- qs.match qs mvs
       | throwError "Internal: pattern {qs} didn't match against itself!"
@@ -251,14 +317,10 @@ def allPatterns (fmv : MVarId) : Tactic.TacticM (List Pattern) := do
       return [default]
   return all
 
-def PatternMap.findMatch? (fmv : MVarId) (args : List Term) (typs : List Expr)
-  : Tactic.TacticM (Option (Pattern × NameMap (Name × Expr))) := do
-  PatternMap.find? fmv args typs
-
 def PatternMap.findMatch (fmv : MVarId) (args : List Term) (typs : List Expr)
   (pattRef? : Option Term := none)
   : Tactic.TacticM (Pattern × NameMap (Name × Expr)) := do
-  if let some (pattern, names) <- findMatch? fmv args typs then
+  if let some (pattern, names) <- find? fmv args typs then
     return (pattern, names)
   else
     if let some p := pattRef? then

@@ -544,7 +544,8 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
   | `($f:ident) => do
     let mv <- findCalcTarget f.getId f
     let mv_ty <- mv.getType''
-    let to_expr <- Term.elabTerm to_term (some mv_ty)
+    let to_expr <- mv.withContext <|
+      Term.elabTerm to_term (some mv_ty)
     define_mv f.getId.target to_expr
   | `($f:ident $rest*) => do
     let mv <- findCalcTarget f.getId f
@@ -599,7 +600,7 @@ private def elabGive
     throwErrorAt asIds[res.length]!
       "Too many 'as' names given! the tactic generated {res.length} goals"
   for (i, r) in ids.zip res do
-    r.setUserName i
+    r.setUserName i.target
   for r in res do
     r.setKind .syntheticOpaque
   -- If we produce exactly one goal, and it has the same name as the original
@@ -661,7 +662,8 @@ private def applyPrePatt
   if let some prePatt := prePatt? then
     { pattern with
       ps := prePatt.ps ++ pattern.ps
-      transform ctx := prePatt.transform ctx >=> transformRecursion prePatt.ps ctx }
+      transform ctx :=
+        prePatt.transform ctx >=> pattern.transform ctx }
   else
     pattern
 
@@ -732,8 +734,6 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
       let rec_name := mkRecName ival.name
       let goal_names <- ival.ctors.mapM fun ctor =>
         getUnusedUserName (ctor.replacePrefix ival.name vId)
-      -- TODO: this used to be (mv? := mv?), but I changed it to this because it makes
-      -- more sense. If something breaks, check this.
       let goals <- elabGive v #[] (keepGoals := true) (mv? := mv?)
         (goal_names.toArray.map mkIdent)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
@@ -798,6 +798,51 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
       PatternMap.insert pattern
     -- Expose the new goals to the proof state
     Tactic.appendGoals (casesSubgoals.toList.map (·.mvarId))
+  | `(give_by| if $discr:matchDiscr) => do
+    let (h, prop) <- match discr with
+    | `(matchDiscr| $h : $prop) =>
+      let inf := h.raw.getInfo?.getD .none
+      pure (.mk <| Syntax.node1 inf `Lean.binderIdent h, prop)
+    | `(matchDiscr| $prop:term) =>
+      pure (<- `(binderIdent| _), prop)
+    | _ => throwUnsupportedSyntax
+    -- Generate names for the two branches: f.pos and f.neg
+    let posName <- getUnusedUserName (vId.str "pos")
+    let negName <- getUnusedUserName (vId.str "neg")
+    let hypName <- match h with
+      | `(binderIdent| $i:ident) => pure i.getId
+      | `(binderIdent| _) => pure `h
+      | _ => throwUnsupportedSyntax
+    -- Save current goals, focus on holeMv, apply the if-split
+    let prevGoals <- Tactic.getGoals
+    let inGoals <- prevGoals.anyM (fun g => return g == holeMv)
+    if !inGoals then Tactic.setGoals (holeMv :: prevGoals)
+    let tac <- `(tactic| refine if $h : $prop then ?_ else ?_)
+    let branches <- Tactic.evalTacticAt tac holeMv
+    -- Restore previous goals (we'll re-add branches at the end)
+    -- Tactic.setGoals (prevGoals.filter (· != holeMv))
+    match branches with
+    | [posMv, negMv] =>
+      -- Name the branches so findCalcTarget can find them later.
+      posMv.setUserName posName.target
+      negMv.setUserName negName.target
+      posMv.setKind .syntheticOpaque
+      negMv.setKind .syntheticOpaque
+      let transform := prePatt?.map (·.transform) |>.getD default
+      PatternMap.insert <| applyPrePatt prePatt? {
+        fname := vId, fmv := rootMv, endpointMv := posMv
+        ps := [.bind (.var hypName) (.ctor ``true [])]
+        refine := fun _ => return posMv, transform
+      }
+      PatternMap.insert <| applyPrePatt prePatt? {
+        fname := vId, fmv := rootMv, endpointMv := negMv
+        ps := [.bind (.var hypName) (.ctor ``false [])]
+        refine := fun _ => return negMv, transform
+      }
+      -- Expose both branches as goals
+      Tactic.appendGoals [posMv, negMv]
+    | _ =>
+      throwError "give by if: expected 2 goals from if-split, got {branches.length}"
   | `(give_by| aux ($_auxFn:ident : $auxTy:term) $_auxArgs:term*) => do
     logErrorAt auxTy "Auxiliary function type annotations are not yet supported."
   | `(give_by| aux $auxId:ident $auxArgs:term*) => do
@@ -853,6 +898,12 @@ def elabGivePattBy
     tempLCtx := subSimul (names.map fun _ (new, _) => new) tempLCtx
     withLCtx' tempLCtx do
       elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
+  let mctx <- getMCtx
+  for (mv, da) in mctx.dAssignment do
+    logInfo m!"delayed assignment {Expr.mvar mv}:\n\
+    pending on: {da.mvarIdPending}
+    which is assigned? {<- da.mvarIdPending.isAssigned}
+    and fvars: {da.fvars}"
   return ()
 
 def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
@@ -920,6 +971,13 @@ def calc_intro_other (as_name : Name) (field_ty : Expr)
     mkFreshExprMVar (some field_ty) (kind := .syntheticOpaque)
   field_body.mvarId!.setUserName as_name.target
   let fv <- intro_let_in_main_goal as_name field_ty (.mvar (field_body.mvarId!))
+  -- field_body was created before 'as_name' was introduced into the main goal's lctx,
+  -- so its lctx doesn't yet contain the let binding for the function being calculated.
+  -- Extend it now so that inner goals derived from field_body (e.g. the branches of
+  -- 'give f n by if h : ...') can reference 'as_name' and prove properties like
+  -- 'f 10 = 0' before the negative branch is filled in.
+  let extLCtx <- Tactic.withMainContext getLCtx
+  field_body.mvarId!.modifyLCtx fun _ => extLCtx
   Tactic.appendGoals [field_body.mvarId!]
   return (field_body, fv)
 
@@ -1037,7 +1095,7 @@ elab "unpkg" : tactic => Tactic.withMainContext do
 elab (name := collectTac)
   "collect " body:tacticSeq : tactic =>
   Tactic.withMainContext do
-  patternsRef.set {}
+  -- patternsRef.set {}
   -- let target <- Tactic.getMainTarget
   Tactic.evalTactic body
   -- Unsure if I still need this...
@@ -1171,6 +1229,103 @@ def test_def : Eg := by
   give f n := n
   grind
 
+set_option pp.rawOnError true
+
+structure EgIf where
+  f : Nat -> Nat
+  correct : ∀ n, f n ≤ n + 1
+
+
+def test_if : EgIf := by
+  calculate f
+  -- TODO: for tomorrow, we should be able to prove things about the positive
+  -- case before defining the negative one.
+  give f n by if n > 5
+  give f n (h := true) := 0
+  have h : f 10 = 0 := by
+    rfl
+  give f n (h := false) := n
+  grind
+
+def test_if2
+  : Σ' f : Nat -> Nat -> Nat, ∀ n, f 0 n = 0 := by
+  calculate fst as f
+  give f by recursion
+  give? f
+  give f.zero => exact fun m => 0
+  -- In Lean InfoView:
+  --   `f : ℕ → ℕ → ℕ := Nat.rec (motive := fun t ↦ ℕ → ℕ) (fun m ↦ 0) ?target.f.succ`
+  -- And so we're able to show the desired conclusion *before* defining
+  -- the final case.
+  intro n
+  trivial
+  give f.succ => exact fun n n_ih m => n
+
+set_option pp.mvars.delayed true
+
+def test_if3
+  : Σ' f : Nat -> Nat -> Nat, ∀ n, f n 0 = 0 := by
+  calculate fst as f
+  give f n by recursion
+  -- Here we do recursion but take the extra argument first.
+  -- By doing this, it prevents us from seeing the proper definition while
+  -- we're calculating.
+  give f m .zero := 0
+  intro n
+  simp only [f]
+
+  -- Trivial / rfl / etc... should work, but don't here.
+  -- rfl
+  -- In Lean InfoView: `f : ℕ → ℕ → ℕ := fun n ↦ ?m.25 n`. This is because of delayed
+  -- assignment. A metavariable introduced under a binder is delayed assigned like this,
+  -- to this metavar ?m.25, which can then depend on the arguement n.
+  -- Btw it only prints like this because i have pp.mvars.delayed = true
+  --
+  -- Instead, I would like this to not happen. I want it to literally be assigned to:
+  -- `f : ℕ -> ℕ -> ℕ := fun n => ?m
+  -- and ?m has in-scope `n`. This is possible due to my pattern refinement and transformation
+  -- mechanism, in theory -- when we fill the metavariable, we can explicitly substitute the
+  -- bound variables to make it correct syntactically.
+
+  give f.succ => exact fun n_ih m => n
+  -- Only here can we actually see the recursor definition
+  -- The goal is actually solved immediately after this `give`, as give also
+  -- tries triviality
+
+def test_if3_but_working
+  : Σ' f : Nat -> Nat -> Nat, ∀ n, f n 0 = 0 := by
+  calculate fst as f
+
+  -- We can begin instead by refining it to a hole. But importantly, this hole
+  -- is NOT defined inside the function binder, but outside it, beforehand.
+  give f as hole => let hole : Nat -> Nat := ?a; refine fun m => hole
+
+  -- The 'snd' goal now looks like this:
+  -- case snd
+  -- f : ℕ → ℕ → ℕ := let hole := ?target.hole;
+  -- fun m ↦ hole
+  -- ⊢ ∀ (n : ℕ), f n 0 = 0
+  -- Okay, this is a bit weird, having the let there.
+  -- I'm certain there's a better way to do it without having that! But still,.
+  -- it works okay.
+
+  give hole by recursion
+  -- It then becomes:
+  /-
+  f : ℕ → ℕ → ℕ := let hole := Nat.rec ?target.hole.zero ?target.hole.succ;
+                    fun m ↦ hole
+  -/
+
+  give hole .zero := 0
+
+  -- Now we can prove the equation
+  intro n
+  simp only [f]
+  rfl
+
+  -- And finally we can give the succ case, but it doesn't matter what
+  give hole (.succ n) := n
+
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?target.rev
   -- give rev as fastrev =>
@@ -1181,23 +1336,24 @@ def test_aux_def : List Nat := by
   give fastrev (x :: xs) ys := fastrev xs (x :: ys)
   exact []
 
--- def eg :
---     Σ' f : List Nat -> Nat -> List Nat,
---     f [] 5 = [5]
---   := by
---   collect
---     calculate fst as f
---     -- give f (y :: ys) n a true := n
---     give f => apply List.rec
---     give f.nil as f.cond.true f.cond.false =>
---       refine fun n => if h : n = 5 then blank else blank
---     unfold f
---     simp
---     -- define2 f x y z (h := true) := [5]
---     give f.cond.true => exact fun n h => [5]
---     rfl
---   give f.cond.false => exact fun n h => []
---   give f.cons => exact fun n ns «f.ns» m => []
+def eg :
+    Σ' f : List Nat -> Nat -> List Nat,
+    f [] 5 = [5]
+  := by
+  collect
+    calculate fst as f
+    -- give f (y :: ys) n a true := n
+    give f => apply List.rec
+    -- give f.nil n by if n = 5
+    -- give f.nil as f.cond.true f.cond.false =>
+    --   refine fun n => if h : n = 5 then ?x else ?y
+    give f.nil as f.nil' => refine fun n => blank u
+    give f.nil' as f.cond.true f.cond.false => refine fun n => if n == 5 then ?x else ?y
+    unfold f
+    simp only [BEq.rfl]
+    give f.cond.true := [5]
+  give f.cond.false := []
+  give f.cons => exact fun n ns «f.ns» m => []
 
 -- def eg2 : Eg := by
 --   calculate f, g
