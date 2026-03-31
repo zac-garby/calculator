@@ -293,16 +293,4 @@ def PatternMap.findMatch (fmv : MVarId) (args : List Term) (typs : List Expr)
     else
       throwError "No matching 'give' definition pattern found."
 
-def subSimul (names : NameMap Name) (lctx : LocalContext) : LocalContext :=
-  let names := names.toList
-  let decls := names.map fun (old, _) => lctx.findFromUserName? old
-  (decls.zip names).foldl (init := lctx) fun lctx (decl, _old, new) =>
-    match decl with
-    | none => lctx
-    | some decl =>
-      let decl := decl.setUserName new
-      { lctx with
-        fvarIdToDecl := lctx.fvarIdToDecl.insert decl.fvarId decl,
-        decls := lctx.decls.set decl.index decl }
-
 end Tactic.Calculation

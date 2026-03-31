@@ -4,6 +4,7 @@ import Calculator.Pattern
 
 
 namespace Lean
+
 def Name.recOf (name f : Name) := f ++ name
 def Name.target (name : Name) : Name := .mkStr1 "target" ++ name
 
@@ -13,17 +14,6 @@ def LocalContext.eraseUserName (lctx : LocalContext) (name : Name) :=
   else
     lctx
 
-def LocalContext.applyNames
-  (lctx : LocalContext) (names : Tactic.Calculation.NameMap Name)
-  (f? : Option Name)
-  : LocalContext := Id.run do
-  let mut names := names
-  if let some f := f? then
-    for decl in lctx do
-      if let some suff := f.isPrefixOf? decl.userName then
-        let new := f ++ names.getD suff suff
-        names := names.insert decl.userName new
-  Tactic.Calculation.subSimul names lctx
 end Lean
 
 namespace Tactic.Calculation
@@ -42,6 +32,30 @@ macro "don't" "care" : term => `(panic! "found out the hard way that we do actua
 elab "todo" : tactic => return ()
 elab "todo" "[" term "]" : tactic => return ()
 def no_proof := "todo"
+
+def subSimul (names : NameMap Name) (lctx : LocalContext) : LocalContext :=
+  let names := names.toList
+  let decls := names.map fun (old, _) => lctx.findFromUserName? old
+  (decls.zip names).foldl (init := lctx) fun lctx (decl, _old, new) =>
+    match decl with
+    | none => lctx
+    | some decl =>
+      let decl := decl.setUserName new
+      { lctx with
+        fvarIdToDecl := lctx.fvarIdToDecl.insert decl.fvarId decl,
+        decls := lctx.decls.set decl.index decl }
+
+def applyNames
+  (lctx : LocalContext) (names : Tactic.Calculation.NameMap Name)
+  (f? : Option Name)
+  : LocalContext := Id.run do
+  let mut names := names
+  if let some f := f? then
+    for decl in lctx do
+      if let some suff := f.isPrefixOf? decl.userName then
+        let new := f ++ names.getD suff suff
+        names := names.insert decl.userName new
+  Tactic.Calculation.subSimul names lctx
 
 /--
 Find a calculation target. This is a metavariable with the given name, but it
@@ -573,7 +587,7 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
       let hole <- pattern.refine ctx
       -- Rename the local variables according to the names
       -- given in the pattern.
-      hole.modifyLCtx fun lctx => lctx.applyNames
+      hole.modifyLCtx fun lctx => applyNames lctx
         (names.map fun _ (old, _) => old)
         (f? := f.getId)
       hole.withContext do
@@ -704,6 +718,8 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
   : TacticM Term := do
   let body <- body.raw.rewriteBottomUpM fun
   | stx@`($f:ident $args:term*) => do
+    if args.isEmpty then
+      return stx
     let numPre := pre.length
     for (pre, p) in args.toList.zip (ctx.ps.take numPre) do
       let (r, _) <- mkArgPatt pre none |>.run' default
@@ -728,8 +744,7 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
       let arg_name := arg_id.getId
       let some (_, new_name, _) := ctx.names.toList
         |>.find? (fun (_, n, _) => n == arg_name)
-        | throwErrorAt arg0 "Can't make recursive call on {arg0}\n\
-          Names: {ctx.names.toList.map fun (k, v, _) => (k, v)}"
+        | throwErrorAt arg0 "Can't make recursive call on {arg0}"
       let new_rec_name := new_name.recOf f.getId
       if (<- getLCtx).usesUserName new_rec_name then
         `($(mkIdent new_rec_name) $(args.toArray)*)
@@ -903,8 +918,8 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
       pure (<- `(binderIdent| _), prop)
     | _ => throwUnsupportedSyntax
     -- Generate names for the two branches: f.pos and f.neg
-    let posName <- getUnusedUserName (vId.str "pos")
-    let negName <- getUnusedUserName (vId.str "neg")
+    let posName <- getUnusedUserName (vId.str "yes")
+    let negName <- getUnusedUserName (vId.str "no")
     let hypName <- match h with
       | `(binderIdent| $i:ident) => pure i.getId
       | `(binderIdent| _) => pure `h
@@ -990,7 +1005,7 @@ def elabGivePattBy
     names, body, goal_name := f, goal_ty := mv_ty, ps := qs
   }
   hole.modifyLCtx <| fun lctx =>
-    lctx.applyNames (names.map fun _ (old, _) => old) f.getId
+    applyNames lctx (names.map fun _ (old, _) => old) f.getId
   hole.withContext do
     elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
   return ()
@@ -1354,16 +1369,16 @@ def test_if2
 set_option pp.mvars.delayed true
 
 def test_if3
-  : Σ' f : Nat -> Nat -> Nat, ∀ n, f n 0 = 0 := by
+  : Σ' f : Nat -> Nat -> Nat, ∀ l, f l 0 = 0 := by
   calculate fst as f
   give f n by recursion
   -- `give h0 :` defines the zero case AND introduces h0 : ∀ m, f m 0 = 0
   give h0 : f m .zero := 0
   intro u; apply h0
-  -- give f u (.succ n) := f u n
-  give f m (.succ n) by if n = 3
-  give f m (.succ n) (h := true) := m
-  give f m (.succ n) (h := false) := ?_
+  give f m (.succ u) by if h : u = 3
+  give p : f m (.succ n) (h := true) := m
+  trivial
+  -- give f z (.succ u) (h := false) := ?_
 
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?target.rev
