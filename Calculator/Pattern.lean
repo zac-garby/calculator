@@ -104,7 +104,7 @@ partial def mkArgPatt (stx : Term) (typ? : Option Expr)
     let (ctor, _) := fn.getAppFnArgs
     return (.ctor ctor [], fn)
 
-def mkPatt (args : List Term) (typs : List Expr)
+def mkPatt (args : List Term) (typs : List Expr := [])
   : Tactic.TacticM (Patt × NameMap MVarId) := do
   let m := (args.zipLeft typs).mapM fun (arg, typ?) => do
     let (q, _) <- mkArgPatt arg typ?
@@ -136,6 +136,12 @@ partial def Patt.matchPatt (ps qs : Patt)
   : OptionT (StateM (NameMap Name)) Unit := do
   guard (ps.length == qs.length)
   _ <- ps.zipWithM (·.match) qs
+
+partial def Patt.matchExact (ps qs : Patt) : Bool :=
+  if let (some (), names) := (ps.matchPatt qs).run default then
+    names.all (· = ·)
+  else
+    false
 end
 
 /--
@@ -202,12 +208,12 @@ initialize
   patternsRef : IO.Ref PatternMap <- IO.mkRef {}
 
 def PatternMap.insert (pattern : Pattern) : MetaM Unit := do
-  patternsRef.modify fun (pm : Std.HashSet _) => pm.insert pattern
+  -- patternsRef.modify fun (pm : Std.HashSet _) => pm.insert pattern
     -- Erase before insert so that re-elaboration (which resets mvar ID counters and
   -- may produce the same (fname, ps, fmv) triple) replaces the stale entry rather
   -- than leaving the old one with a dead endpointMv in the map.
-  -- patternsRef.modify fun (pm : Std.HashSet _) =>
-  --   (pm.erase pattern).insert pattern
+  patternsRef.modify fun (pm : Std.HashSet _) =>
+    (pm.erase pattern).insert pattern
 
 private def refineTakeArgs
   (names : List Name)
@@ -221,49 +227,6 @@ private def refineTakeArgs
     goal'.setUserName .anonymous
     goal := goal'
   return goal
-
--- let mut goal := goal
---   let tag <- goal.getTag
---   let (argTys, retTy) <- goal.getType <&> unarrow
---   let (args, argTys') := names.zipLeft' argTys
---   let retTy' <- mkArrowN argTys'.toArray retTy
---   let (fn, hole) <- goal.withContext <| do
---     let body <- mkFreshExprMVar retTy' (userName := tag.str "body")
---     let mut hole := body.mvarId!
---     let fvs <- args.mapM fun (name, ty) => do
---       let some ty := ty | throwError "Too many arguments given!"
---       let fv <- hole.withContext <|
---         mkFreshExprMVar ty (userName := name)
---       -- let hole' <- hole.define name ty fv
---       -- logInfo m!"hole' = {hole'}"
---       hole.modifyLCtx fun lctx => lctx.mkLocalDecl fv.fvarId! name ty
---       pure fv
---     -- for (name, fv) in names.zip fvs do
---     --   let (fv', hole') <- hole.let name fv
---     --   hole := hole'
-
---     -- let mut fvs' := #[]
---     --   fvs' := fvs'.push (.fvar fv')
---     -- logInfo m!"make fn from {fvs'} and {hole}"
---     let fn <- mkLambdaFVars fvs.toArray (.mvar hole)
---     logInfo m!"fn = {fn}"
---     logInfo s!"fn = {fn}"
---     return (fn, hole)
---   goal.assign fn
---   return hole
---   -- for old in names do
---   --   let (_fv, goal') <- goal.intro old
---   --   -- Clear userName so the new mvar doesn't collide with the parent's userName
---   --   -- in findCalcTarget lookups (MVarId.intro inherits the parent's userName).
---   --   let tag <- goal'.getTag
---   --   goal'.setUserName (tag ++ old)
---   --   do
---   --     logInfo m!"intro'd {old} in goal \
---   --     (= {Expr.mvar goal}) assigned?{<- goal.isAssigned}:\n{goal}\n  \
---   --     to goal' (= {Expr.mvar goal'}) assigned?{<- goal'.isAssigned}:\n{goal'}\n  \
---   --   we have fv: {_fv.name}"
---   --   goal := goal'
---   -- return goal
 
 private def mkTakeArgsPattern (fmv : MVarId) (names? : Option (List Name) := none)
   : MetaM (Option Pattern) := do

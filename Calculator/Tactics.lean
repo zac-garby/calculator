@@ -12,6 +12,18 @@ def LocalContext.eraseUserName (lctx : LocalContext) (name : Name) :=
     lctx.erase fv.fvarId
   else
     lctx
+
+def LocalContext.applyNames
+  (lctx : LocalContext) (names : Tactic.Calculation.NameMap Name)
+  (f? : Option Name)
+  : LocalContext := Id.run do
+  let mut names := names
+  if let some f := f? then
+    for decl in lctx do
+      if let some suff := f.isPrefixOf? decl.userName then
+        let new := f ++ names.getD suff suff
+        names := names.insert decl.userName new
+  Tactic.Calculation.subSimul names lctx
 end Lean
 
 namespace Tactic.Calculation
@@ -454,12 +466,15 @@ syntax (name := giveTactic)
   "give?" ident : tactic
 @[inherit_doc giveTactic] syntax (name := giveDefTactic)
   "give" term " := " term : tactic
+@[inherit_doc giveTactic] syntax (name := giveDefHypTactic)
+  "give" ident " : " term " := " term : tactic
 @[inherit_doc giveTactic] syntax (name := giveByTactic)
   "give" term " by " give_by : tactic
 
 #allow_unused_tactic! giveTactic
 #allow_unused_tactic! giveAskTactic
 #allow_unused_tactic! giveDefTactic
+#allow_unused_tactic! giveDefHypTactic
 #allow_unused_tactic! giveByTactic
 
 /- Should support:
@@ -556,19 +571,91 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
     let ctx := {names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := qs}
     withRef to_term <| do
       let hole <- pattern.refine ctx
+      -- Rename the local variables according to the names
+      -- given in the pattern.
+      hole.modifyLCtx fun lctx => lctx.applyNames
+        (names.map fun _ (old, _) => old)
+        (f? := f.getId)
       hole.withContext do
         let to_term' <- pattern.transform ctx to_term
-        -- Rename the local variables according to the names
-        -- given in the pattern.
-        let mut tempLCtx <- getLCtx
-        tempLCtx := subSimul (names.map fun _ (old, _) => old) tempLCtx
-        for (old, new, _ty) in ctx.names do
-          tempLCtx := tempLCtx.renameUserName (old.recOf f.getId) (new.recOf f.getId)
-        let val <- withLCtx' tempLCtx do
-          Tactic.elabTermEnsuringType to_term' (<- hole.getType)
-        hole.assignIfDefEq val
+        let mvs <- Tactic.evalTacticAt (<- `(tactic| exact $to_term')) hole
+        unless mvs.isEmpty do
+          throwError "Unexpected: 'give' assignment produced new metavariables!"
   | _ => do
     throwUnsupportedSyntax
+
+/-- Collect (fvId, userName, type) and the concrete Expr for one pattern arg. -/
+private partial def buildHypArg
+    (pat : ArgPatt) (names : NameMap (Name × Expr))
+    : MetaM (Expr × Array (FVarId × Name × Expr)) := do
+  match pat with
+  | .var internalName =>
+    let some (userName, ty) := names.get? internalName
+      | throwError "Internal: pattern var '{internalName}' not in names"
+    let fvId <- mkFreshFVarId
+    return (.fvar fvId, #[(fvId, userName, ty)])
+  | .ctor ctorName ctorArgPatts =>
+    let ctorConst <- mkConstWithFreshMVarLevels ctorName
+    let mut allDecls : Array (FVarId × Name × Expr) := #[]
+    let mut ctorArgs : Array Expr := #[]
+    for innerPat in ctorArgPatts do
+      let (innerExpr, innerDecls) <- buildHypArg innerPat names
+      allDecls := allDecls ++ innerDecls
+      ctorArgs := ctorArgs.push innerExpr
+    return (mkAppN ctorConst ctorArgs, allDecls)
+  | .bind _hypName valPat =>
+    -- .bind is used by `if` patterns: the hypothesis name is bound to a concrete value.
+    -- We don't quantify over it; just use the concrete value expression.
+    buildHypArg valPat names
+
+/--
+Like `elabGiveDef`, but also introduces a universally-quantified hypothesis.
+`give h : f m .zero := 0` defines the clause AND adds `h : ∀ m, f m 0 = 0`.
+-/
+private def elabGiveDefHyp (hypName : Ident) (p to_term : Term) : TacticM Unit
+    := Tactic.withMainContext do
+  let `($f:ident $rest*) := p
+    | throwErrorAt p "'give {hypName} :' requires a pattern like 'f args...'"
+  elabGiveDef p to_term
+  let mv <- findCalcTarget f.getId f
+  let mv_ty <- mv.getType''
+  let (args, _) := unarrow mv_ty
+  let (pattern, names) <- PatternMap.findMatch mv rest.toList args
+  -- Build the hypothesis in the main goal's context so `f` refers to its let-fvar
+  Tactic.withMainContext do
+    -- Find the fvar for `f` in the current lctx (it's a let-binding := ?target.f)
+    let lctx <- getLCtx
+    let some fDecl := lctx.findFromUserName? f.getId
+      | throwErrorAt f "'{f.getId}' not found in local context"
+    let fFVar := Expr.fvar fDecl.fvarId
+    -- Build arg exprs and collect all fvar declarations from the pattern
+    let mut allFvDecls : Array (FVarId × Name × Expr) := #[]
+    let mut argExprs   : Array Expr := #[]
+    for (pat, _) in pattern.ps.zip args do
+      let (argExpr, decls) <- buildHypArg pat names
+      allFvDecls := allFvDecls ++ decls
+      argExprs   := argExprs.push argExpr
+    -- lhs = f applied to all concrete pattern args
+    -- rhs = the value just assigned (instantiate the hole mvar, which is now closed)
+    let lhs := mkAppN fFVar argExprs
+    let ctx' := { names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := pattern.ps }
+    let hole <- pattern.refine ctx'
+    let rhs <- instantiateMVars (.mvar hole)
+    -- Build ∀ fvars, lhs = rhs  with proof  fun fvars => rfl (holds by iota)
+    let hyp_lctx := allFvDecls.foldl
+      (fun lctx (fvId, name, ty) => lctx.mkLocalDecl fvId name ty .default)
+      lctx
+    let fvarExprs := allFvDecls.map fun (fvId, _, _) => Expr.fvar fvId
+    let (hyp_ty, hyp_val) <- withLCtx' hyp_lctx do
+      let eqTy  <- mkEq lhs rhs
+      let ty    <- mkForallFVars fvarExprs eqTy
+      let refl  <- mkEqRefl lhs
+      let val   <- mkLambdaFVars fvarExprs refl
+      return (ty, val)
+    let main_mv <- Tactic.getMainGoal
+    let main_mv <- main_mv.assert hypName.getId hyp_ty hyp_val
+    let (_, new_main) <- main_mv.intro1P
+    Tactic.replaceMainGoal [new_main]
 
 private def elabGive
   (v : TSyntax `ident) (args : TSyntaxArray `Lean.binderIdent)
@@ -624,6 +711,14 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
         throwErrorAt stx "Can't make recursive call at {stx}\n\
         Wrong index (i.e. non-recursive) arguments\n\
         Expected: {f} {Std.format (ctx.ps.take numPre : Patt)} ..."
+    let preArgs := args.take numPre |>.toList
+    let prePatt : Patt := ctx.ps.take numPre
+    let (prePatt', _) <- mkPatt preArgs
+    if !Patt.matchExact prePatt prePatt' then
+      throwErrorAt stx "Can't make recursive call at {stx}\n\
+      Invalid pre-induction arguments.\n  \
+      Got: {f} {Std.format prePatt'} ..\n  \
+      Expected: {f} {Std.format prePatt} .."
     let (arg0 :: args) := args.drop numPre |>.toList
       | throwErrorAt stx "Can't make recursive call at {stx}\n\
       Not enough arguments"
@@ -631,15 +726,13 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
       let `($arg_id:ident) := arg0
         | throwErrorAt arg0 "Can't make recursive call on {arg0}"
       let arg_name := arg_id.getId
-      let some (old_name, new_name, _) := ctx.names.toList
+      let some (_, new_name, _) := ctx.names.toList
         |>.find? (fun (_, n, _) => n == arg_name)
         | throwErrorAt arg0 "Can't make recursive call on {arg0}\n\
           Names: {ctx.names.toList.map fun (k, v, _) => (k, v)}"
-      let old_rec_name := old_name.recOf f.getId
       let new_rec_name := new_name.recOf f.getId
-      if let some _recur := (<- getLCtx).findFromUserName? old_rec_name then
-        let s <- `($(mkIdent new_rec_name) $(args.toArray)*)
-        return s
+      if (<- getLCtx).usesUserName new_rec_name then
+        `($(mkIdent new_rec_name) $(args.toArray)*)
       else
         throwErrorAt stx "Can't make recursive call in non-recursive case\n\
         (Expecting in-scope {new_rec_name})"
@@ -670,6 +763,7 @@ private def applyPrePatt
 private def buildCtorPattern
   (id : Name) (rootMv : MVarId) (inp_ty motive : Expr) (us : List Level)
   (rest_args : List Expr) (ival : InductiveVal) (ctor : Name) (goal : MVarId)
+  (prePatt? : Option Pattern := none)
   : MetaM Pattern := do
   let env <- getEnv
   let some ctor_val := env.find? ctor
@@ -709,6 +803,7 @@ private def buildCtorPattern
     ps := ctor_patt :: rest_patts
     refine := refineRecursion goal_args goal
     transform := transformRecursion
+      (pre := prePatt?.map (·.ps) |>.getD [])
   }
 
 def elabGiveBy (v : Ident) (b : TSyntax `give_by)
@@ -739,7 +834,8 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
       assert! goals.length == goal_names.length
       for (goal, ctor) in goals.zip ival.ctors do
-        let pattern <- buildCtorPattern vId rootMv inp_ty motive us rest_args ival ctor goal
+        let pattern <- buildCtorPattern vId rootMv inp_ty motive
+          us rest_args ival ctor goal prePatt?
         let pattern := applyPrePatt prePatt? pattern
         PatternMap.insert pattern
   | `(give_by| cases of $argTerm:term) => do
@@ -893,17 +989,10 @@ def elabGivePattBy
   let hole <- pattern.refine {
     names, body, goal_name := f, goal_ty := mv_ty, ps := qs
   }
+  hole.modifyLCtx <| fun lctx =>
+    lctx.applyNames (names.map fun _ (old, _) => old) f.getId
   hole.withContext do
-    let mut tempLCtx <- getLCtx
-    tempLCtx := subSimul (names.map fun _ (new, _) => new) tempLCtx
-    withLCtx' tempLCtx do
-      elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
-  let mctx <- getMCtx
-  for (mv, da) in mctx.dAssignment do
-    logInfo m!"delayed assignment {Expr.mvar mv}:\n\
-    pending on: {da.mvarIdPending}
-    which is assigned? {<- da.mvarIdPending.isAssigned}
-    and fvars: {da.fvars}"
+    elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
   return ()
 
 def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
@@ -941,6 +1030,8 @@ elab_rules : tactic
     | _ => throwUnsupportedSyntax
   | `(tactic| give $v:ident $args:binderIdent* => $tac) =>
     tryClose <| elabGive v args #[] tac (keepGoals := true)
+  | `(tactic| give $h:ident : $p:term := $to_term:term) => do
+    tryClose <| elabGiveDefHyp h p to_term
   | `(tactic| give $p:term := $to_term:term) => do
     tryClose <| elabGiveDef p to_term
   | `(tactic| give $v:ident by $b:give_by) => do
@@ -1251,7 +1342,6 @@ def test_if2
   : Σ' f : Nat -> Nat -> Nat, ∀ n, f 0 n = 0 := by
   calculate fst as f
   give f by recursion
-  give? f
   give f.zero => exact fun m => 0
   -- In Lean InfoView:
   --   `f : ℕ → ℕ → ℕ := Nat.rec (motive := fun t ↦ ℕ → ℕ) (fun m ↦ 0) ?target.f.succ`
@@ -1267,64 +1357,13 @@ def test_if3
   : Σ' f : Nat -> Nat -> Nat, ∀ n, f n 0 = 0 := by
   calculate fst as f
   give f n by recursion
-  -- Here we do recursion but take the extra argument first.
-  -- By doing this, it prevents us from seeing the proper definition while
-  -- we're calculating.
-  give f m .zero := 0
-  intro n
-  simp only [f]
-
-  -- Trivial / rfl / etc... should work, but don't here.
-  -- rfl
-  -- In Lean InfoView: `f : ℕ → ℕ → ℕ := fun n ↦ ?m.25 n`. This is because of delayed
-  -- assignment. A metavariable introduced under a binder is delayed assigned like this,
-  -- to this metavar ?m.25, which can then depend on the arguement n.
-  -- Btw it only prints like this because i have pp.mvars.delayed = true
-  --
-  -- Instead, I would like this to not happen. I want it to literally be assigned to:
-  -- `f : ℕ -> ℕ -> ℕ := fun n => ?m
-  -- and ?m has in-scope `n`. This is possible due to my pattern refinement and transformation
-  -- mechanism, in theory -- when we fill the metavariable, we can explicitly substitute the
-  -- bound variables to make it correct syntactically.
-
-  give f.succ => exact fun n_ih m => n
-  -- Only here can we actually see the recursor definition
-  -- The goal is actually solved immediately after this `give`, as give also
-  -- tries triviality
-
-def test_if3_but_working
-  : Σ' f : Nat -> Nat -> Nat, ∀ n, f n 0 = 0 := by
-  calculate fst as f
-
-  -- We can begin instead by refining it to a hole. But importantly, this hole
-  -- is NOT defined inside the function binder, but outside it, beforehand.
-  give f as hole => let hole : Nat -> Nat := ?a; refine fun m => hole
-
-  -- The 'snd' goal now looks like this:
-  -- case snd
-  -- f : ℕ → ℕ → ℕ := let hole := ?target.hole;
-  -- fun m ↦ hole
-  -- ⊢ ∀ (n : ℕ), f n 0 = 0
-  -- Okay, this is a bit weird, having the let there.
-  -- I'm certain there's a better way to do it without having that! But still,.
-  -- it works okay.
-
-  give hole by recursion
-  -- It then becomes:
-  /-
-  f : ℕ → ℕ → ℕ := let hole := Nat.rec ?target.hole.zero ?target.hole.succ;
-                    fun m ↦ hole
-  -/
-
-  give hole .zero := 0
-
-  -- Now we can prove the equation
-  intro n
-  simp only [f]
-  rfl
-
-  -- And finally we can give the succ case, but it doesn't matter what
-  give hole (.succ n) := n
+  -- `give h0 :` defines the zero case AND introduces h0 : ∀ m, f m 0 = 0
+  give h0 : f m .zero := 0
+  intro u; apply h0
+  -- give f u (.succ n) := f u n
+  give f m (.succ n) by if n = 3
+  give f m (.succ n) (h := true) := m
+  give f m (.succ n) (h := false) := ?_
 
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?target.rev
@@ -1436,94 +1475,94 @@ def revCalc {a} : RevSpec a := by
 
 def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
 
-inductive Exp' : Type
-  | val : Nat -> Exp'
-  | add : Exp' -> Exp' -> Exp'
-  deriving BEq
+-- inductive Exp' : Type
+--   | val : Nat -> Exp'
+--   | add : Exp' -> Exp' -> Exp'
+--   deriving BEq
 
-@[simp]
-def eval' : Exp' -> Nat
-  | .val n => n
-  | .add x y => eval' x + eval' y
+-- @[simp]
+-- def eval' : Exp' -> Nat
+--   | .val n => n
+--   | .add x y => eval' x + eval' y
 
-inductive Code' where
-  | push : ℕ → Code' → Code'
-  | add : Code' → Code'
+-- inductive Code' where
+--   | push : ℕ → Code' → Code'
+--   | add : Code' → Code'
 
-abbrev Stack' := List Nat
+-- abbrev Stack' := List Nat
 
-compile_inductive% Exp'
-compile_inductive% Code'
-open Exp' Code'
+-- compile_inductive% Exp'
+-- compile_inductive% Code'
+-- open Exp' Code'
 
-structure CompSpec' where
-  comp : Exp' -> Code' -> Code'
-  exec : Code' -> Stack' -> Stack'
-  correct : ∀ e c s, exec c (eval' e :: s) = exec (comp e c) s
+-- structure CompSpec' where
+--   comp : Exp' -> Code' -> Code'
+--   exec : Code' -> Stack' -> Stack'
+--   correct : ∀ e c s, exec c (eval' e :: s) = exec (comp e c) s
 
-def comp_calc' : CompSpec' := by
-  calculate comp, exec
-  give comp by recursion
-  give exec by recursion
-  intro e
-  (induction e) <;> intros c s
-  case val n =>
-    calc
-      exec c (eval' (Exp'.val n) :: s)
-      _ = exec c (n :: s) := by rfl
-      _ = exec (Code'.push n c) s
-        := by give exec (Code'.push n c) s := exec c (n :: s)
-      _ = exec (comp (Exp'.val n) c) s
-        := by give comp (Exp'.val n) c := Code'.push n c
-  case add x y ih_x ih_y =>
-    calc
-      exec c (eval' (Exp'.add x y) :: s)
-      _ = exec c ((eval' x + eval' y) :: s) := by rfl
-      _ = let u_1 := eval' y; let u := eval' x;
-          exec c ((u + u_1) :: s) := by rfl
-      _ = let u_1 := eval' y; let u := eval' x;
-          exec (Code'.add c) (u :: u_1 :: s)
-          := by define exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
-      _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
-      _ = exec (comp x (Code'.add c)) (eval' y :: s)
-          := by simp only [ih_x]
-      _ = exec (comp y (comp x (Code'.add c))) s
-          := by simp only [ih_y]
-      _ = exec (comp (Exp'.add x y) c) s
-          := by give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
+-- def comp_calc' : CompSpec' := by
+--   calculate comp, exec
+--   give comp by recursion
+--   give exec by recursion
+--   intro e
+--   (induction e) <;> intros c s
+--   case val n =>
+--     calc
+--       exec c (eval' (Exp'.val n) :: s)
+--       _ = exec c (n :: s) := by rfl
+--       _ = exec (Code'.push n c) s
+--         := by give exec (Code'.push n c) s := exec c (n :: s)
+--       _ = exec (comp (Exp'.val n) c) s
+--         := by give comp (Exp'.val n) c := Code'.push n c
+--   case add x y ih_x ih_y =>
+--     calc
+--       exec c (eval' (Exp'.add x y) :: s)
+--       _ = exec c ((eval' x + eval' y) :: s) := by rfl
+--       _ = let u_1 := eval' y; let u := eval' x;
+--           exec c ((u + u_1) :: s) := by rfl
+--       _ = let u_1 := eval' y; let u := eval' x;
+--           exec (Code'.add c) (u :: u_1 :: s)
+--           := by define exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
+--       _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
+--       _ = exec (comp x (Code'.add c)) (eval' y :: s)
+--           := by simp only [ih_x]
+--       _ = exec (comp y (comp x (Code'.add c))) s
+--           := by simp only [ih_y]
+--       _ = exec (comp (Exp'.add x y) c) s
+--           := by give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
 
-#print comp_calc'
+-- #print comp_calc'
 
--- Test: give by cases of
-def comp_calc'' : CompSpec' := by
-  calculate comp, exec
-  give comp by recursion
-  give exec by recursion
-  -- Case-split the stack argument of exec.add, then fill the real case
-  give exec (Code'.add c) s by cases of s
-  give exec (Code'.add c) (u :: s) by cases of s
-  give exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
-  give comp (Exp'.val n) c := Code'.push n c
-  give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
-  give exec (Code'.push n c) s := exec c (n :: s)
-  -- Fill unused exec.add cases (nil and singleton stack)
-  all_goals (try exact default)
-  -- Correctness proof
-  intro e
-  (induction e) <;> intros c s
-  case val n => rfl
-  case add x y ih_x ih_y =>
-    calc
-      exec c (eval' (Exp'.add x y) :: s)
-      _ = exec c ((eval' x + eval' y) :: s) := by rfl
-      _ = let u_1 := eval' y; let u := eval' x; exec c ((u + u_1) :: s) := by rfl
-      _ = let u_1 := eval' y; let u := eval' x;
-          exec (Code'.add c) (u :: u_1 :: s) := by rfl
-      _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
-      _ = exec (comp x (Code'.add c)) (eval' y :: s) := by simp only [ih_x]
-      _ = exec (comp y (comp x (Code'.add c))) s := by simp only [ih_y]
-      _ = exec (comp (Exp'.add x y) c) s := by rfl
+-- -- Test: give by cases of
+-- def comp_calc'' : CompSpec' := by
+--   calculate comp, exec
+--   give comp by recursion
+--   give exec by recursion
+--   -- Case-split the stack argument of exec.add, then fill the real case
+--   give exec (Code'.add c) s by cases of s
+--   give exec (Code'.add c) (u :: s) by cases of s
+--   give exec (Code'.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
+--   give comp (Exp'.val n) c := Code'.push n c
+--   give comp (Exp'.add x y) c := comp y (comp x (Code'.add c))
+--   give exec (Code'.push n c) s := exec c (n :: s)
+--   -- Fill unused exec.add cases (nil and singleton stack)
+--   all_goals (try exact default)
+--   -- Correctness proof
+--   intro e
+--   (induction e) <;> intros c s
+--   case val n => rfl
+--   case add x y ih_x ih_y =>
+--     calc
+--       exec c (eval' (Exp'.add x y) :: s)
+--       _ = exec c ((eval' x + eval' y) :: s) := by rfl
+--       _ = let u_1 := eval' y; let u := eval' x; exec c ((u + u_1) :: s) := by rfl
+--       _ = let u_1 := eval' y; let u := eval' x;
+--           exec (Code'.add c) (u :: u_1 :: s) := by rfl
+--       _ = exec (Code'.add c) (eval' x :: eval' y :: s) := by rfl
+--       _ = exec (comp x (Code'.add c)) (eval' y :: s) := by simp only [ih_x]
+--       _ = exec (comp y (comp x (Code'.add c))) s := by simp only [ih_y]
+--       _ = exec (comp (Exp'.add x y) c) s := by rfl
 
-#print comp_calc''
+-- #print comp_calc''
 
 end Tactic.Calculation
