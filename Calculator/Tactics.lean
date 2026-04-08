@@ -567,7 +567,16 @@ private def showLCtx (lctx : Option LocalContext := none) : MetaM Format := do
   return f!"lctx:\n  \
   {msg}"
 
-private def elabGiveDef (p to_term : Term) : TacticM Unit
+def ArgPatt.toTerm (p : ArgPatt) : Option Term := match p with
+  | .var n => mkIdent n
+  | .ctor c args => Syntax.mkApp
+    (mkIdent c)
+    (args.filterMap (·.toTerm) |>.toArray)
+  | _ => none
+
+private def elabGiveDef
+  (p to_term : Term) (hypName? : Option Name := none)
+  : TacticM Unit
   := Tactic.withMainContext do
   match p with
   | `($f:ident) => do
@@ -583,44 +592,60 @@ private def elabGiveDef (p to_term : Term) : TacticM Unit
     let (qs, _mvs) <- mkPatt rest.toList args
     let (pattern, names) <- PatternMap.findMatch mv rest.toList args (pattRef? := p)
     let ctx := {names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := qs}
-    withRef to_term <| do
-      let hole <- pattern.refine ctx
-      -- Rename the local variables according to the names
-      -- given in the pattern.
-      hole.modifyLCtx fun lctx => applyNames lctx
-        (names.map fun _ (old, _) => old)
-        (f? := f.getId)
-      hole.withContext do
-        let to_term' <- pattern.transform ctx to_term
-        let mvs <- Tactic.evalTacticAt (<- `(tactic| exact $to_term')) hole
-        unless mvs.isEmpty do
-          throwError "Unexpected: 'give' assignment produced new metavariables!"
+    let hole <- pattern.refine ctx
+    let hole_ty <- hole.getType
+    -- Rename the local variables according to the names
+    -- given in the pattern.
+    let tempLCtx := applyNames (<- hole.withContext getLCtx)
+      (names.map fun _ (old, _) => old)
+      (f? := f.getId)
+    -- hole.modifyLCtx fun lctx => applyNames lctx
+    --   (names.map fun _ (old, _) => old)
+    --   (f? := f.getId)
+    let body <- withRef to_term <| withLCtx' tempLCtx do
+      let to_term' <- pattern.transform ctx to_term
+      let body <- Tactic.elabTermEnsuringType to_term' hole_ty
+      hole.assignIfDefEq body
+      pure body
+      -- let mvs <- Tactic.evalTacticAt (<- `(tactic| exact $to_term')) hole
+      -- unless mvs.isEmpty do
+      --   throwError "Unexpected: 'give' assignment produced new metavariables!"
+    -- Now we've given our definition, if we are supposed to introduce a hypothesis
+    -- for it, do that now.
+    if let some hypName := hypName? then
+      let prop <- hole.withContext do
+        let propLCtx <- getLCtx
+        let fvs <- pattern.foralls.mapM fun (name, _ty) => do
+          let some decl := propLCtx.findFromUserName? name
+            | throwError "Internal: {name} doesn't exist in the local context, \
+            when forming a 'give' hypothesis"
+          let fv := decl.fvarId
+          pure (.fvar fv)
+        let fnApp <- withLCtx' tempLCtx do
+          let realArgs := qs.filterMap (·.toTerm)
+          let tm <- `(term| $f $(realArgs.toArray)*)
+          Tactic.elabTerm tm hole_ty
+        let (_, fvst) <- fnApp.collectFVars.run {}
+        let some fnFv := (<- getLCtx).findFromUserName? f.getId
+          | throwError "Can't find target function {f.getId} in local contxt"
+        let fvs := fvst.fvarIds
+          |>.filter (fun fv => fv != fnFv.fvarId)
+          |>.map (.fvar ·)
+          |>.append fvs
+        let concl <- mkEq fnApp body
+        let prop <- mkForallFVars fvs concl (usedOnly := true)
+        pure prop
+      let proof <- mkFreshExprMVar prop
+      let goal <- Tactic.getMainGoal
+      let (_hypFvs, goal') <- goal.assertHypotheses #[{
+        userName := hypName
+        type := prop
+        value := proof
+      }]
+      Tactic.replaceMainGoal [goal']
+      Tactic.appendGoals [proof.mvarId!]
   | _ => do
     throwUnsupportedSyntax
-
-/-- Collect (fvId, userName, type) and the concrete Expr for one pattern arg. -/
-private partial def buildHypArg
-    (pat : ArgPatt) (names : NameMap (Name × Expr))
-    : MetaM (Expr × Array (FVarId × Name × Expr)) := do
-  match pat with
-  | .var internalName =>
-    let some (userName, ty) := names.get? internalName
-      | throwError "Internal: pattern var '{internalName}' not in names"
-    let fvId <- mkFreshFVarId
-    return (.fvar fvId, #[(fvId, userName, ty)])
-  | .ctor ctorName ctorArgPatts =>
-    let ctorConst <- mkConstWithFreshMVarLevels ctorName
-    let mut allDecls : Array (FVarId × Name × Expr) := #[]
-    let mut ctorArgs : Array Expr := #[]
-    for innerPat in ctorArgPatts do
-      let (innerExpr, innerDecls) <- buildHypArg innerPat names
-      allDecls := allDecls ++ innerDecls
-      ctorArgs := ctorArgs.push innerExpr
-    return (mkAppN ctorConst ctorArgs, allDecls)
-  | .bind _hypName valPat =>
-    -- .bind is used by `if` patterns: the hypothesis name is bound to a concrete value.
-    -- We don't quantify over it; just use the concrete value expression.
-    buildHypArg valPat names
 
 /--
 Like `elabGiveDef`, but also introduces a universally-quantified hypothesis.
@@ -628,48 +653,74 @@ Like `elabGiveDef`, but also introduces a universally-quantified hypothesis.
 -/
 private def elabGiveDefHyp (hypName : Ident) (p to_term : Term) : TacticM Unit
     := Tactic.withMainContext do
-  let `($f:ident $rest*) := p
+  let `($_f:ident $_rest*) := p
     | throwErrorAt p "'give {hypName} :' requires a pattern like 'f args...'"
-  elabGiveDef p to_term
-  let mv <- findCalcTarget f.getId f
-  let mv_ty <- mv.getType''
-  let (args, _) := unarrow mv_ty
-  let (pattern, names) <- PatternMap.findMatch mv rest.toList args
-  -- Build the hypothesis in the main goal's context so `f` refers to its let-fvar
-  Tactic.withMainContext do
-    -- Find the fvar for `f` in the current lctx (it's a let-binding := ?target.f)
-    let lctx <- getLCtx
-    let some fDecl := lctx.findFromUserName? f.getId
-      | throwErrorAt f "'{f.getId}' not found in local context"
-    let fFVar := Expr.fvar fDecl.fvarId
-    -- Build arg exprs and collect all fvar declarations from the pattern
-    let mut allFvDecls : Array (FVarId × Name × Expr) := #[]
-    let mut argExprs   : Array Expr := #[]
-    for (pat, _) in pattern.ps.zip args do
-      let (argExpr, decls) <- buildHypArg pat names
-      allFvDecls := allFvDecls ++ decls
-      argExprs   := argExprs.push argExpr
-    -- lhs = f applied to all concrete pattern args
-    -- rhs = the value just assigned (instantiate the hole mvar, which is now closed)
-    let lhs := mkAppN fFVar argExprs
-    let ctx' := { names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := pattern.ps }
-    let hole <- pattern.refine ctx'
-    let rhs <- instantiateMVars (.mvar hole)
-    -- Build ∀ fvars, lhs = rhs  with proof  fun fvars => rfl (holds by iota)
-    let hyp_lctx := allFvDecls.foldl
-      (fun lctx (fvId, name, ty) => lctx.mkLocalDecl fvId name ty .default)
-      lctx
-    let fvarExprs := allFvDecls.map fun (fvId, _, _) => Expr.fvar fvId
-    let (hyp_ty, hyp_val) <- withLCtx' hyp_lctx do
-      let eqTy  <- mkEq lhs rhs
-      let ty    <- mkForallFVars fvarExprs eqTy
-      let refl  <- mkEqRefl lhs
-      let val   <- mkLambdaFVars fvarExprs refl
-      return (ty, val)
-    let main_mv <- Tactic.getMainGoal
-    let main_mv <- main_mv.assert hypName.getId hyp_ty hyp_val
-    let (_, new_main) <- main_mv.intro1P
-    Tactic.replaceMainGoal [new_main]
+  elabGiveDef p to_term (hypName? := hypName.getId)
+  -- logInfo m!"give hyp at {f} {rest}"
+  -- let mv <- findCalcTarget f.getId f
+  -- let mv_ty <- mv.getType''
+  -- let (args, _) := unarrow mv_ty
+  -- let (qs, mvs) <- mkPatt rest.toList args
+  -- let mut forallFvs := #[]
+  -- for q in qs do
+  --   match q with
+  --   | .var qn =>
+  --     let qty <- mvs[qn]!.getType
+  --     let fv <- mkFreshExprMVar qty (userName := qn)
+  --     forallFvs := forallFvs.push fv
+  --   | .ctor c cargs => pure ()
+  --   | .bind a b => pure ()
+  -- let prop <- mkForallFVars' forallFvs (<- Term.elabTerm (<- `(term| top)) none)
+  -- logInfo m!"prop = {prop}"
+  -------
+  -- let (pattern, names) <- PatternMap.findMatch mv rest.toList args
+  -- -- Build the hypothesis in the main goal's context so `f` refers to its let-fvar
+  -- Tactic.withMainContext do
+  --   -- Find the fvar for `f` in the current lctx (it's a let-binding := ?target.f)
+  --   let lctx <- getLCtx
+  --   let some fDecl := lctx.findFromUserName? f.getId
+  --     | throwErrorAt f "'{f.getId}' not found in local context"
+  --   let fFVar := Expr.fvar fDecl.fvarId
+  --   -- Get the hole (now assigned) to find its lctx (for .bind / if-branch hypotheses)
+  --   let ctx' := { names, body := to_term, goal_name := f, goal_ty := mv_ty, ps := pattern.ps }
+  --   let hole <- pattern.refine ctx'
+  --   let holeLCtx <- hole.withContext getLCtx
+  --   let rhs <- instantiateMVars (.mvar hole)
+  --   -- All building is done in the hole's lctx so hole fvars (m, n, h) are in scope.
+  --   -- The hole inherits all let-bindings from parent goals, so fFVar is also valid here.
+  --   let (hyp_ty, hyp_val) <- withLCtx' holeLCtx do
+  --     let mut allFvDecls  : Array (FVarId × Name × Expr) := #[]
+  --     let mut argExprs    : Array Expr := #[]
+  --     let mut preconds    : Array Expr := #[]
+  --     for (pat, _) in pattern.ps.zip args do
+  --       match <- buildHypArg pat names holeLCtx with
+  --       | .arg expr decls => allFvDecls := allFvDecls ++ decls; argExprs := argExprs.push expr
+  --       | .pre cond =>
+  --         -- inferType uses holeLCtx, so the condition type references hole fvars correctly
+  --         preconds := preconds.push (<- inferType cond)
+  --     -- lhs = f applied to all arg exprs (all using hole fvars)
+  --     let lhs := mkAppN fFVar argExprs
+  --     let fvarExprs := allFvDecls.map fun (fvId, _, _) => Expr.fvar fvId
+  --     let eqTy  <- mkEq lhs rhs
+  --     -- Fold preconditions as implications: pre₁ → pre₂ → ... → lhs = rhs
+  --     let body  := preconds.foldr (fun pre acc => .forallE `_ pre acc .default) eqTy
+  --     let ty    <- mkForallFVars fvarExprs body
+  --     -- Proof: fun fvars => fun _ : pre₁ => ... => rfl
+  --     let refl  <- mkEqRefl lhs
+  --     let proof := preconds.foldr (fun pre acc => .lam `_ pre acc .default) refl
+  --     let val   <- mkLambdaFVars fvarExprs proof
+  --     return (ty, val)
+  --   -- Inject into the first unassigned non-target goal (the spec/proof goal)
+  --   let goals <- Tactic.getGoals
+  --   let some specGoal <- goals.findM? fun (g : MVarId) => do
+  --       if <- g.isAssigned then return false
+  --       let tag <- g.getTag
+  --       return !tag.toString.startsWith "target"
+  --     | return ()  -- no suitable goal; silently skip
+  --   let specGoal' <- specGoal.assert hypName.getId hyp_ty hyp_val
+  --   let (_, new_spec) <- specGoal'.intro1P
+  --   let goals' <- goals.mapM fun g => if g == specGoal then pure new_spec else pure g
+  --   Tactic.setGoals goals'
 
 private def elabGive
   (v : TSyntax `ident) (args : TSyntaxArray `Lean.binderIdent)
@@ -727,14 +778,6 @@ private def transformRecursion (pre : Patt := []) (ctx : MatchCtx) (body : Term)
         throwErrorAt stx "Can't make recursive call at {stx}\n\
         Wrong index (i.e. non-recursive) arguments\n\
         Expected: {f} {Std.format (ctx.ps.take numPre : Patt)} ..."
-    let preArgs := args.take numPre |>.toList
-    let prePatt : Patt := ctx.ps.take numPre
-    let (prePatt', _) <- mkPatt preArgs
-    if !Patt.matchExact prePatt prePatt' then
-      throwErrorAt stx "Can't make recursive call at {stx}\n\
-      Invalid pre-induction arguments.\n  \
-      Got: {f} {Std.format prePatt'} ..\n  \
-      Expected: {f} {Std.format prePatt} .."
     let (arg0 :: args) := args.drop numPre |>.toList
       | throwErrorAt stx "Can't make recursive call at {stx}\n\
       Not enough arguments"
@@ -770,12 +813,13 @@ private def applyPrePatt
   if let some prePatt := prePatt? then
     { pattern with
       ps := prePatt.ps ++ pattern.ps
+      foralls := prePatt.foralls ++ pattern.foralls
       transform ctx :=
         prePatt.transform ctx >=> pattern.transform ctx }
   else
     pattern
 
-private def buildCtorPattern
+private def buildRecPattern
   (id : Name) (rootMv : MVarId) (inp_ty motive : Expr) (us : List Level)
   (rest_args : List Expr) (ival : InductiveVal) (ctor : Name) (goal : MVarId)
   (prePatt? : Option Pattern := none)
@@ -819,6 +863,7 @@ private def buildCtorPattern
     refine := refineRecursion goal_args goal
     transform := transformRecursion
       (pre := prePatt?.map (·.ps) |>.getD [])
+    foralls := goal_args.map (·.swap)
   }
 
 def elabGiveBy (v : Ident) (b : TSyntax `give_by)
@@ -849,7 +894,7 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         (<- `(tacticSeq| apply $(mkIdent rec_name)))
       assert! goals.length == goal_names.length
       for (goal, ctor) in goals.zip ival.ctors do
-        let pattern <- buildCtorPattern vId rootMv inp_ty motive
+        let pattern <- buildRecPattern vId rootMv inp_ty motive
           us rest_args ival ctor goal prePatt?
         let pattern := applyPrePatt prePatt? pattern
         PatternMap.insert pattern
@@ -918,8 +963,9 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
       pure (<- `(binderIdent| _), prop)
     | _ => throwUnsupportedSyntax
     -- Generate names for the two branches: f.pos and f.neg
-    let posName <- getUnusedUserName (vId.str "yes")
-    let negName <- getUnusedUserName (vId.str "no")
+    let holeName <- holeMv.getTag
+    let posName <- getUnusedUserName (holeName.str "yes")
+    let negName <- getUnusedUserName (holeName.str "no")
     let hypName <- match h with
       | `(binderIdent| $i:ident) => pure i.getId
       | `(binderIdent| _) => pure `h
@@ -928,15 +974,19 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
     let prevGoals <- Tactic.getGoals
     let inGoals <- prevGoals.anyM (fun g => return g == holeMv)
     if !inGoals then Tactic.setGoals (holeMv :: prevGoals)
-    let tac <- `(tactic| refine if $h : $prop then ?_ else ?_)
-    let branches <- Tactic.evalTacticAt tac holeMv
-    -- Restore previous goals (we'll re-add branches at the end)
-    -- Tactic.setGoals (prevGoals.filter (· != holeMv))
+    let body_term <- `(if $h : $prop then ?_ else ?_)
+    let (body, branches) <- Tactic.elabTermWithHoles body_term holeTy vId
+    holeMv.assignIfDefEq body
     match branches with
     | [posMv, negMv] =>
       -- Name the branches so findCalcTarget can find them later.
-      posMv.setUserName posName.target
-      negMv.setUserName negName.target
+      posMv.setUserName posName
+      negMv.setUserName negName
+      let holeCtx <- holeMv.withContext getLCtx
+      posMv.modifyLCtx fun lctx =>
+        holeCtx.addDecl (lctx.findFromUserName? hypName |>.get!)
+      negMv.modifyLCtx fun lctx =>
+        holeCtx.addDecl (lctx.findFromUserName? hypName |>.get!)
       posMv.setKind .syntheticOpaque
       negMv.setKind .syntheticOpaque
       let transform := prePatt?.map (·.transform) |>.getD default
@@ -944,11 +994,13 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         fname := vId, fmv := rootMv, endpointMv := posMv
         ps := [.bind (.var hypName) (.ctor ``true [])]
         refine := fun _ => return posMv, transform
+        foralls := #[]
       }
       PatternMap.insert <| applyPrePatt prePatt? {
         fname := vId, fmv := rootMv, endpointMv := negMv
         ps := [.bind (.var hypName) (.ctor ``false [])]
         refine := fun _ => return negMv, transform
+        foralls := #[]
       }
       -- Expose both branches as goals
       Tactic.appendGoals [posMv, negMv]
@@ -1004,9 +1056,11 @@ def elabGivePattBy
   let hole <- pattern.refine {
     names, body, goal_name := f, goal_ty := mv_ty, ps := qs
   }
-  hole.modifyLCtx <| fun lctx =>
+  let lctx <- hole.withContext getLCtx
+  let tempLCtx :=
     applyNames lctx (names.map fun _ (old, _) => old) f.getId
-  hole.withContext do
+  -- hole.modifyLCtx <| fun lctx =>
+  withLCtx' tempLCtx do
     elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
   return ()
 
@@ -1304,7 +1358,8 @@ elab "mv_info" v:ident : tactic => withMainContext do
     readonly? {<- mv.isReadOnly}
     declared? {<- mv.isDeclared}
     delayed?  {<- mv.isDelayedAssigned}
-    assigned? {<- mv.isAssigned}"
+    assigned? {<- mv.isAssigned}
+    lctx: {<- mv.withContext showLCtx}"
 
 elab "dbg_reduce" t:term : tactic => withMainContext do
   let exp <- withoutErrToSorry <| Term.elabTerm t none
@@ -1347,24 +1402,23 @@ def test_if : EgIf := by
   -- TODO: for tomorrow, we should be able to prove things about the positive
   -- case before defining the negative one.
   give f n by if n > 5
-  give f n (h := true) := 0
-  have h : f 10 = 0 := by
-    rfl
-  give f n (h := false) := n
+  give f n (h := true) := n
+  -- have h : f 10 = 0 := by
+  --   rfl
+  give f v (h := false) := v
   grind
 
 def test_if2
   : Σ' f : Nat -> Nat -> Nat, ∀ n, f 0 n = 0 := by
   calculate fst as f
   give f by recursion
-  give f.zero => exact fun m => 0
-  -- In Lean InfoView:
-  --   `f : ℕ → ℕ → ℕ := Nat.rec (motive := fun t ↦ ℕ → ℕ) (fun m ↦ 0) ?target.f.succ`
-  -- And so we're able to show the desired conclusion *before* defining
-  -- the final case.
+  give h : f .zero m := 0
+  give h1 : f (.succ n) u := u
+  -- Prove the actual theorem
   intro n
-  trivial
-  give f.succ => exact fun n n_ih m => n
+  apply h n
+  -- Prove the given hypotheses
+  all_goals { intros; trivial }
 
 set_option pp.mvars.delayed true
 
@@ -1373,12 +1427,19 @@ def test_if3
   calculate fst as f
   give f n by recursion
   -- `give h0 :` defines the zero case AND introduces h0 : ∀ m, f m 0 = 0
-  give h0 : f m .zero := 0
-  intro u; apply h0
-  give f m (.succ u) by if h : u = 3
-  give p : f m (.succ n) (h := true) := m
-  trivial
-  -- give f z (.succ u) (h := false) := ?_
+  give h0 : f m .zero := 0 * m
+
+  give f m (.succ v) by if h : v = 3
+
+  -- should be: p : ∀ m, n,  f m (.succ n)
+  give h1 : f m (.succ n) (h := true) := m
+  -- have p : ∀ m n, ∀ (h : n = 3), f m (.succ n) = m := fun m n h => ?b
+  give f m (.succ n) (h := false) := n
+  -- when we 'give', we could automatically try to close associated hypotheses
+  intro l
+  -- simp only [Nat.zero_mul] at h0
+  -- apply h0 l
+  -- grind
 
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?target.rev

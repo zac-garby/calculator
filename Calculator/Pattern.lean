@@ -189,6 +189,7 @@ structure Pattern where
   ps : Patt
   refine : Refinement
   transform : Transformer := default
+  foralls : Array (Name × Expr) := #[]
 
 instance : ToFormat Pattern where
   format p := f!"{p.fname} {p.ps}"
@@ -238,9 +239,11 @@ private def mkTakeArgsPattern (fmv : MVarId) (names? : Option (List Name) := non
   let un <- getUnusedUserName (.mkStr1 "x")
   let names := names?.getD <| args.mapIdx fun i _exp => un.appendIndexAfter i
   let qs := names.map (.var ·)
+  let foralls := names.zip args
   let pattern : Pattern := {
     fname := tag, fmv := fmv, endpointMv := fmv, ps := qs
     refine := refineTakeArgs names fmv
+    foralls := foralls.toArray
   }
   return pattern
 
