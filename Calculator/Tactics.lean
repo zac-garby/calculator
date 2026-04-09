@@ -607,9 +607,6 @@ private def elabGiveDef
       let body <- Tactic.elabTermEnsuringType to_term' hole_ty
       hole.assignIfDefEq body
       pure body
-      -- let mvs <- Tactic.evalTacticAt (<- `(tactic| exact $to_term')) hole
-      -- unless mvs.isEmpty do
-      --   throwError "Unexpected: 'give' assignment produced new metavariables!"
     -- Now we've given our definition, if we are supposed to introduce a hypothesis
     -- for it, do that now.
     if let some hypName := hypName? then
@@ -635,7 +632,10 @@ private def elabGiveDef
         let concl <- mkEq fnApp body
         let prop <- mkForallFVars fvs concl (usedOnly := true)
         pure prop
-      let proof <- mkFreshExprMVar prop
+      let proof <- mkFreshExprMVar prop (userName := hypName.str "proofOf")
+      proof.mvarId!.withContext do
+        let (_fvs, proof) <- proof.mvarId!.intros
+        proof.refl (check := false)
       let goal <- Tactic.getMainGoal
       let (_hypFvs, goal') <- goal.assertHypotheses #[{
         userName := hypName
@@ -643,7 +643,6 @@ private def elabGiveDef
         value := proof
       }]
       Tactic.replaceMainGoal [goal']
-      Tactic.appendGoals [proof.mvarId!]
   | _ => do
     throwUnsupportedSyntax
 
@@ -1417,29 +1416,30 @@ def test_if2
   -- Prove the actual theorem
   intro n
   apply h n
-  -- Prove the given hypotheses
-  all_goals { intros; trivial }
 
-set_option pp.mvars.delayed true
+-- set_option pp.mvars.delayed true
 
 def test_if3
   : Σ' f : Nat -> Nat -> Nat, ∀ l, f l 0 = 0 := by
   calculate fst as f
   give f n by recursion
   -- `give h0 :` defines the zero case AND introduces h0 : ∀ m, f m 0 = 0
-  give h0 : f m .zero := 0 * m
+  give h0 : f m .zero := 0
 
   give f m (.succ v) by if h : v = 3
 
   -- should be: p : ∀ m, n,  f m (.succ n)
-  give h1 : f m (.succ n) (h := true) := m
+  give h1 : f m (.succ n) (h := true) := 0
   -- have p : ∀ m n, ∀ (h : n = 3), f m (.succ n) = m := fun m n h => ?b
   give f m (.succ n) (h := false) := n
   -- when we 'give', we could automatically try to close associated hypotheses
   intro l
-  -- simp only [Nat.zero_mul] at h0
-  -- apply h0 l
-  -- grind
+
+  simp only [Nat.zero_eq] at h0
+  apply h0 l
+
+  -- Now prove the hypotheses
+
 
 def test_aux_def : List Nat := by
   let rev : List Nat -> List Nat := ?target.rev
