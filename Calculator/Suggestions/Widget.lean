@@ -101,7 +101,14 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
       let spc := String.replicate params.indent ' '
       let mut suggestions <- all_suggestions main_goal doc params lhs rhs
       if suggestions.isEmpty then
-        return #[<p>{.text "No suggestions"}</p>]
+        let new_chain <- render_chain rel [lhs, rhs]
+        return #[<p>Need to show:</p>] ++ new_chain ++ #[
+          <p>
+            No available suggestions for this step.
+            Remember, you can shift+click on the goal above to
+            rewrite or factor subterms.
+          </p>
+        ]
       let ul_style := json%{
         listStyleType: "\"⚡ \"",
         paddingLeft: "20px"

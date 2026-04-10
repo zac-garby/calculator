@@ -5,6 +5,7 @@ import Mathlib.Data.Nat.Basic
 import Mathlib.Util.CompileInductive
 
 open Tactic.Calculation
+open List
 
 @[simp]
 def rev {a} : List a → List a
@@ -32,16 +33,14 @@ def revCalc {a} : RevSpec a := by
         := by rfl
     _ = rev xs ++ ([x] ++ ys)
         := by simp only [List.append_assoc]
-    _ = fastrev xs ([x] ++ ys)
-        := by rw [ih]
-    _ = fastrev xs (x :: ys)
+    _ = rev xs ++ x :: ys
         := by rfl
+    _ = fastrev xs (x :: ys)
+        := by rw [ih]
     _ = fastrev (x :: xs) ys
         := by give fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
 def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
-
-open List
 
 abbrev Sorted (xs : List Nat) := Pairwise (· ≤ ·) xs
 
@@ -123,7 +122,6 @@ inductive Code where
 
 abbrev Stack := List Nat
 
-
 compile_inductive% Exp
 compile_inductive% Code
 open Exp
@@ -138,35 +136,35 @@ def comp_calc : CompSpec := by
   calculate comp, exec
   give comp by recursion
   give exec by recursion
-  give exec (Code.add c) s by cases of s
-  give exec (Code.add c) (u :: s) by cases of s
-  give exec (Code.add c) (u :: u_1 :: s) := exec c ((u + u_1) :: s)
-  give comp (Exp.val n) c := Code.push n c
-  give comp (Exp.add x y) c := comp y (comp x (Code.add c))
-  give exec (Code.push n c) s := exec c (n :: s)
-  all_goals (try exact [])
   intro e
   induction e <;> intros c s
-  case val n =>
-    calc
-      exec c (eval (Exp.val n) :: s)
-      _ = exec c (n :: s) := by rfl
-      _ = exec (Code.push n c) s := by rfl
-      _ = exec (comp (Exp.val n) c) s := by rfl
-  case add x y ih_x ih_y =>
-    calc
-      exec c (eval (Exp.add x y) :: s)
-      _ = exec c ((eval x + eval y) :: s) := by rfl
-      _ = let u_1 := eval y; let u := eval x;
-          exec c ((u + u_1) :: s) := by rfl
-      _ = let u_1 := eval y; let u := eval x;
-          exec (Code.add c) (u :: u_1 :: s) := by rfl
-      _ = exec (Code.add c) (eval x :: eval y :: s) := by rfl
-      _ = exec (comp x (Code.add c)) (eval y :: s)
-          := by simp only [ih_x]
-      _ = exec (comp y (comp x (Code.add c))) s
-          := by simp only [ih_y]
-      _ = exec (comp (Exp.add x y) c) s := by rfl
+  case val n => calc
+    exec c (eval (val n) :: s)
+    _ = exec c (n :: s)
+        := by rfl
+    _ = exec (push n c) s
+        := by give exec (push n c) s := exec c (n :: s)
+    _ = exec (comp (val n) c) s
+        := by give comp (val n) c := push n c
+  case add x y ih_x ih_y => calc
+    exec c (eval (add x y) :: s)
+    _ = exec c ((eval x + eval y) :: s)
+        := by rfl
+    _ = exec (add c) (eval x :: eval y :: s)
+        := by {
+          give exec (add c) s by cases of s
+          give exec (add c) (x :: xs) by cases of xs
+          give h : exec (add c) (x :: y :: ys) := exec c ((x + y) :: ys)
+          rw [h]
+          exact []
+          exact []
+        }
+    _ = exec (comp x (Code.add c)) (eval y :: s)
+        := by simp only [ih_x]
+    _ = exec (comp y (comp x (Code.add c))) s
+        := by simp only [ih_y]
+    _ = exec (comp (Exp.add x y) c) s
+        := by give comp (Exp.add x y) c := comp y (comp x (Code.add c))
 
 #print comp_calc
 

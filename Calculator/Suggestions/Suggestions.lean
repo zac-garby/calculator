@@ -268,7 +268,7 @@ def suggest_define : CalcSuggester :=
   let mv := goal.mvarId
   let lhs_stx <- PrettyPrinter.delab lhs
   let rhs_stx <- PrettyPrinter.delab rhs
-  let tac <- `(tactic| define $rhs_stx := $lhs_stx)
+  let tac <- `(tactic| give $rhs_stx := $lhs_stx)
   let save <- Meta.saveState
   let (mvs, _) <- runTactic mv (<- `(tactic| try { $tac }))
   save.restore
@@ -447,7 +447,8 @@ def suggest_replace_subexpr : CalcSuggester := fun goal _doc params _lhs _rhs =>
   let mut goal_ty <- goal.mvarId.getType
   for pos in subs do
     let mv_name <- getUnusedUserName (.str .anonymous "hole")
-    goal_ty <- replaceSubexpr (fun _ => mkFreshExprMVar none (userName := mv_name)) pos goal_ty
+    let mv_expr <- mkFreshExprMVar none (userName := mv_name)
+    goal_ty <- replaceSubexpr (fun _ => pure mv_expr) pos goal_ty
   let some (_, lhs', rhs') <- getCalcRelation? goal_ty
     | return #[]
   if !sel_left && !sel_right then

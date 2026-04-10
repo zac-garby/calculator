@@ -865,6 +865,89 @@ private def buildRecPattern
     foralls := goal_args.map (·.swap)
   }
 
+private def buildCasesPattern
+  (id : Name) (rootMv : MVarId) (origArgName : Name)
+  (subgoal : CasesSubgoal) (prePatt? : Option Pattern := none)
+  : MetaM Pattern := do
+  let some ctorName := subgoal.ctorName
+    | throwError "Internal: buildCasesPattern called on subgoal without ctorName"
+  let fieldInfo : List (Name × Expr) <- subgoal.fields.toList.mapM fun fieldExpr =>
+    subgoal.mvarId.withContext do
+      let some decl := (← getLCtx).find? fieldExpr.fvarId!
+        | throwError "Internal: case field fvar not found"
+      return (decl.userName, decl.type)
+  let fieldNames := fieldInfo.map (·.1)
+  let ctorPatt := ArgPatt.ctor ctorName (fieldNames.map ArgPatt.var)
+  -- Replace the split variable's position in prePatt.ps with ctorPatt.
+  -- This handles both top-level and nested positions (e.g. chained splits).
+  let ps := match prePatt? with
+    | none => [ctorPatt]
+    | some prePatt => prePatt.ps.map (ArgPatt.replace origArgName ctorPatt)
+  -- Carry forward all prePatt foralls except the one for the split variable
+  -- (it's no longer free — it's been replaced by the ctor pattern), then
+  -- append the new constructor field foralls.
+  let prePattForalls := prePatt?.map (·.foralls) |>.getD #[]
+  let filteredForalls := prePattForalls.filter fun (name, _) => name != origArgName
+  return {
+    fname := id, fmv := rootMv, endpointMv := subgoal.mvarId, ps
+    transform := prePatt?.map (·.transform) |>.getD default
+    refine := fun _ => return subgoal.mvarId
+    foralls := filteredForalls ++ fieldInfo.toArray
+  }
+
+private def buildIfPatterns
+  (id : Name) (rootMv posMv negMv : MVarId) (hypName : Name)
+  (prePatt? : Option Pattern := none)
+  : Array Pattern :=
+  let transform := prePatt?.map (·.transform) |>.getD default
+  #[
+    applyPrePatt prePatt? {
+      fname := id, fmv := rootMv, endpointMv := posMv
+      ps := [.bind (.var hypName) (.ctor ``true [])]
+      refine := fun _ => return posMv
+      transform := transform, foralls := #[]
+    },
+    applyPrePatt prePatt? {
+      fname := id, fmv := rootMv, endpointMv := negMv
+      ps := [.bind (.var hypName) (.ctor ``false [])]
+      refine := fun _ => return negMv
+      transform := transform, foralls := #[]
+    }
+  ]
+
+private def buildAuxMvar
+  (auxName : Name) (holeTy : Expr) (rootMv : MVarId) (rootMv? : Option MVarId)
+  (args : Array Expr) (prePatt? : Option Pattern := none)
+  : TacticM MVarId := do
+  let argTys <- args.mapM (inferType ·)
+  let auxTy <- mkArrowN argTys holeTy
+  let auxFn <- mkFreshExprMVar auxTy (userName := auxName.target)
+  let auxApp <- Term.ensureHasType holeTy (mkAppN auxFn args)
+  let auxMv := auxFn.mvarId!
+  -- Remove from the new hole's local context the variables which are used
+  -- in arguments to the new function.
+  auxMv.modifyLCtx fun lctx => lctx.foldl (init := lctx) fun lctx decl =>
+    if auxApp.hasAnyFVar (· == decl.fvarId) then lctx.erase decl.fvarId
+    else lctx
+  -- Build a proper closed lambda for rootMv by abstracting the prePatt fvars.
+  -- This avoids the display issue where `rev := fun xs ↦ ?rev` instead of
+  -- `rev := fun xs ↦ ?fastrev xs []`, which happens because MVarId.intro stores
+  -- `rootMv := fun xs => Expr.mvar holeMv` with xs only accessible via holeMv's
+  -- local context (which is erased from auxMv's context).
+  let prePattVarNames := (prePatt?.map (·.ps) |>.getD []).filterMap fun
+    | .var n => some n | _ => none
+  let prePattFVars <- prePattVarNames.mapM fun n => do
+    let some decl := (← getLCtx).findFromUserName? n
+      | throwError "Internal: pattern var '{n}' not found in aux context"
+    return decl.fvarId
+  let lambda <- mkLambdaFVars (prePattFVars.map .fvar).toArray auxApp
+  -- Use rootMv? (the pre-refineTakeArgs mvar) to assign the closed lambda.
+  -- rootMv from findUserName? may be the inner mvar (after intro), which has wrong type.
+  let trueRootMv := rootMv?.getD rootMv
+  trueRootMv.eraseAssignment
+  trueRootMv.assign lambda
+  return auxMv
+
 def elabGiveBy (v : Ident) (b : TSyntax `give_by)
   (mv? : Option MVarId := none) (prePatt? : Option Pattern := none)
   (rootMv? : Option MVarId := none)
@@ -930,26 +1013,8 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
       subgoal.mvarId.setKind .syntheticOpaque
     -- Build a Pattern for each constructor case
     for subgoal in casesSubgoals do
-      let some ctorName := subgoal.ctorName | continue
-      -- fields are the new constructor arg fvars introduced in this subgoal
-      let fieldNames <- subgoal.fields.toList.mapM fun fieldExpr =>
-        subgoal.mvarId.withContext do
-          let some decl := (← getLCtx).find? fieldExpr.fvarId!
-            | throwError "Internal: case field fvar not found"
-          return decl.userName
-      let ctorPatt := ArgPatt.ctor ctorName (fieldNames.map ArgPatt.var)
-      -- Replace the split variable's position in prePatt.ps with ctorPatt.
-      -- This handles both top-level and nested positions (e.g. chained splits).
-      let ps := match prePatt? with
-        | none => [ctorPatt]
-        | some prePatt => prePatt.ps.map (ArgPatt.replace origArgName ctorPatt)
-      let transform : Transformer := prePatt?.map (·.transform) |>.getD default
-      let pattern : Pattern := {
-        fname := vId, fmv := rootMv, endpointMv := subgoal.mvarId
-        ps
-        refine := fun _ => return subgoal.mvarId
-        transform
-      }
+      let some _ := subgoal.ctorName | continue
+      let pattern <- buildCasesPattern vId rootMv origArgName subgoal prePatt?
       PatternMap.insert pattern
     -- Expose the new goals to the proof state
     Tactic.appendGoals (casesSubgoals.toList.map (·.mvarId))
@@ -988,19 +1053,8 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
         holeCtx.addDecl (lctx.findFromUserName? hypName |>.get!)
       posMv.setKind .syntheticOpaque
       negMv.setKind .syntheticOpaque
-      let transform := prePatt?.map (·.transform) |>.getD default
-      PatternMap.insert <| applyPrePatt prePatt? {
-        fname := vId, fmv := rootMv, endpointMv := posMv
-        ps := [.bind (.var hypName) (.ctor ``true [])]
-        refine := fun _ => return posMv, transform
-        foralls := #[]
-      }
-      PatternMap.insert <| applyPrePatt prePatt? {
-        fname := vId, fmv := rootMv, endpointMv := negMv
-        ps := [.bind (.var hypName) (.ctor ``false [])]
-        refine := fun _ => return negMv, transform
-        foralls := #[]
-      }
+      for pattern in buildIfPatterns vId rootMv posMv negMv hypName prePatt? do
+        PatternMap.insert pattern
       -- Expose both branches as goals
       Tactic.appendGoals [posMv, negMv]
     | _ =>
@@ -1010,33 +1064,7 @@ def elabGiveBy (v : Ident) (b : TSyntax `give_by)
   | `(give_by| aux $auxId:ident $auxArgs:term*) => do
     let auxName := auxId.getId
     let args <- auxArgs.mapM (Tactic.elabTerm · none)
-    let argTys <- args.mapM (inferType ·)
-    let auxTy <- mkArrowN argTys holeTy
-    let auxFn <- mkFreshExprMVar auxTy (userName := auxName.target)
-    let auxApp <- Term.ensureHasType holeTy (mkAppN auxFn args)
-    let auxMv := auxFn.mvarId!
-    -- Remove from the new hole's local context the variables which are used
-    -- in arguments to the new function.
-    auxMv.modifyLCtx fun lctx => lctx.foldl (init := lctx) fun lctx decl =>
-      if auxApp.hasAnyFVar (· == decl.fvarId) then lctx.erase decl.fvarId
-      else lctx
-    -- Build a proper closed lambda for rootMv by abstracting the prePatt fvars.
-    -- This avoids the display issue where `rev := fun xs ↦ ?rev` instead of
-    -- `rev := fun xs ↦ ?fastrev xs []`, which happens because MVarId.intro stores
-    -- `rootMv := fun xs => Expr.mvar holeMv` with xs only accessible via holeMv's
-    -- local context (which is erased from auxMv's context).
-    let prePattVarNames := (prePatt?.map (·.ps) |>.getD []).filterMap fun
-      | .var n => some n | _ => none
-    let prePattFVars <- prePattVarNames.mapM fun n => do
-      let some decl := (← getLCtx).findFromUserName? n
-        | throwError "Internal: pattern var '{n}' not found in aux context"
-      return decl.fvarId
-    let lambda <- mkLambdaFVars (prePattFVars.map .fvar).toArray auxApp
-    -- Use rootMv? (the pre-refineTakeArgs mvar) to assign the closed lambda.
-    -- rootMv from findUserName? may be the inner mvar (after intro), which has wrong type.
-    let trueRootMv := rootMv?.getD rootMv
-    trueRootMv.eraseAssignment
-    trueRootMv.assign lambda
+    let auxMv <- buildAuxMvar auxName holeTy rootMv rootMv? args prePatt?
     Tactic.appendGoals [auxMv]
   | _ => throwUnsupportedSyntax
 
@@ -1063,19 +1091,49 @@ def elabGivePattBy
     elabGiveBy f b (prePatt? := pattern) (mv? := hole) (rootMv? := mv)
   return ()
 
-def elabGiveAsk (v : TSyntax `ident) : TacticM Unit
+partial def patternSyntax (patt : Pattern) : TacticM Term := do
+  let stxs <- patt.ps.toArray.mapM go
+  let argArr : TSyntaxArray `term := stxs.map fun
+    | `(term| $tm) => tm
+  `(term| $(mkIdent patt.fname) $argArr*)
+  where
+    go : ArgPatt -> TacticM Syntax
+    | .var v => do
+      return mkIdent (v.eraseMacroScopes)
+    | .ctor c vs => do
+      let args <- vs.mapM go
+      let argArr : TSyntaxArray `term := args.toArray.map fun
+        | `(term| $tm) => tm
+      `(term| $(mkIdent c) $argArr*)
+    | .bind n v => do
+      let n' <- go n
+      let v' <- go v
+      match n' with
+      | `(ident| $name) => match v' with
+        | `(term| $rhs) => do
+          let t <- `(Lean.Parser.Term.namedArgument| ($name := $rhs))
+          pure t
+
+def elabGiveAsk (stx : Syntax) (v : TSyntax `ident) : TacticM Unit
   := Tactic.withMainContext do
   let mv <- findCalcTarget v.getId v
   let patts <- allPatterns mv
   if !patts.isEmpty then
     let mut fmt : MessageData := m!"Available 'give' patterns for {v}:"
+    let mut suggs := #[]
     for patt in patts do
       fmt := fmt ++ indentD (format patt)
+      let pattStx <- patternSyntax patt
+      logInfo m!"pattStx = {repr pattStx.raw}"
+      let s <- `(tactic| give $pattStx := ?_)
+      suggs := suggs.push (.suggestion s)
     fmt := fmt ++ m!"\n\nOr, use: 'give {v} by ...'"
     for help in giveByHelp do
       fmt := fmt ++ indentD m!"... {help}"
     fmt := fmt ++ "\n"
     logInfo fmt
+    Tactic.TryThis.addSuggestions stx suggs
+      (header := s!"'give' for {v}")
   else
     logInfo m!"No available 'give' patterns for {v}"
 
@@ -1108,8 +1166,8 @@ elab_rules : tactic
     if let `($f:ident $rest*) := p then
       tryClose <| elabGivePattBy p f rest b
     else throwUnsupportedSyntax
-  | `(tactic| give? $v:ident) =>
-    elabGiveAsk v
+  | `(tactic| give? $v:ident) => do
+    elabGiveAsk (<- getRef) v
 
 #allow_unused_tactic! defineTactic
 
@@ -1537,7 +1595,7 @@ def revCalc {a} : RevSpec a := by
     _ = fastrev [] ys
         := by give fastrev [] ys := ys
   case cons x xs ih => calc
-    rev (x :: xs) ++ ys
+        rev (x :: xs) ++ ys
     _ = rev xs ++ [x] ++ ys
         := by rfl
     _ = rev xs ++ ([x] ++ ys)
@@ -1550,6 +1608,18 @@ def revCalc {a} : RevSpec a := by
         := by give fastrev (x :: xs) ys := fastrev xs (x :: ys)
 
 def fastrev {a} : List a -> List a := fun xs => revCalc.fastrev xs []
+
+elab "#typeset " id:ident : command => do
+  let cs <- Command.liftCoreM <| realizeGlobalConstWithInfos id
+  let env <- getEnv
+  for c in cs do match env.find? c with
+  | ConstantInfo.defnInfo { type := t, value := v, .. } => do
+    logInfo m!"Definition {c} = {v}"
+  | none => throwUnknownIdentifierAt id "Unknown identifier"
+  | _ => throwErrorAt id "Not a definition: {c}"
+
+#print revCalc
+#typeset revCalc
 
 -- inductive Exp' : Type
 --   | val : Nat -> Exp'
