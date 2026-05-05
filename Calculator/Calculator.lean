@@ -97,7 +97,9 @@ elab_rules : tactic
     let json := json% {
       "isFirst": $(isFirst),
       "replaceRange": $(replaceRange),
-      "indent": $(replaceRange.start.character)
+      "indent": $(replaceRange.start.character),
+      "relIndent": $(replaceRange.start.character),
+      "altStyle": false
     }
     Widget.savePanelWidgetInfo panel.javascriptHash (pure json) step.proof
     isFirst := false

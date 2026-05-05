@@ -7,7 +7,9 @@ open Lean Meta ProofWidgets Server.Snapshots Server
 
 structure CalcParams extends SelectInsertParams where
   isFirst : Bool
+  altStyle : Bool
   indent : Nat
+  relIndent : Nat
   deriving SelectInsertParamsClass, RpcEncodable
 
 /-- What a suggestion does: replace the current calc step with a sequence of steps.

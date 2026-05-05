@@ -161,6 +161,27 @@ def suggest_already_eq : CalcSuggester := fun _goal _doc _params lhs rhs => do
   else
     return #[]
 
+open Mathlib.Tactic Tactic Hint in
+@[suggest]
+def suggest_hint : CalcSuggester := fun goal _doc _params _lhs _rhs => do
+  let mv := goal.mvarId
+  let tacs := (← getHints).toArray.qsort (·.1 > ·.1)
+    |>.toList.map (·.2)
+  let tacs := Nondet.ofList tacs
+  let results := tacs.filterMapM fun t : TSyntax `tactic => do
+    try
+      let (goals, _st) <- run mv (evalTactic t) |>.run
+      if goals.isEmpty then
+        return some t
+      else
+        return none
+    catch _e => return none
+  let results <- results.toList
+  return #[{
+    hint := "hint"
+    intermediates := #[]
+  }]
+
 @[suggest]
 def suggest_apply_hyp : CalcSuggester := lift_let <| fun goal _doc _params lhs _ => do
   let mv := goal.mvarId
@@ -577,6 +598,9 @@ where
   go (g : Expr → MetaM (List Expr)) : List Nat → Expr → MetaM (List Expr)
     | [],            e => g e
     | head :: tail, e => coord (go g tail) head e
+
+-- Restructuring and constructor case are designed sort of to be used mostly
+-- for implication/reverse-implication.
 
 @[suggest]
 def suggest_restructuring : CalcSuggester := fun goal _doc _params _lhs _rhs => do

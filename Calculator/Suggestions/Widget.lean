@@ -58,6 +58,14 @@ private def new_selection (str : String) : (String.Pos.Raw × String.Pos.Raw) :=
   else
     (str.rawEndPos.dec, str.rawEndPos.dec)
 
+def mkStepSrc (rel rhs tac : Format) (params : CalcParams) : Format :=
+  if params.altStyle then
+    let prf := f!"{rel} by {tac}"
+    f!"{Format.nest params.relIndent prf}\n{rhs}"
+  else
+    let prf := f!"\n:= by {tac}"
+    f!"_ {rel} {rhs}{Format.nest 4 prf}"
+
 /-- Render a sequence of expressions as a chain: `e₀ rel e₁ rel e₂ …` -/
 private def render_chain (rel : String) (exprs : List Expr) : MetaM (Array Html) := do
   let mut parts : Array Html := #[]
@@ -98,7 +106,6 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
       let rhs_s := (<- ppExpr rhs)
         |>.pretty (width := wrap_width) (indent := col) (column := col)
         |> pretty_mvars
-      let spc := String.replicate params.indent ' '
       let mut suggestions <- all_suggestions main_goal doc params lhs rhs
       if suggestions.isEmpty then
         let new_chain <- render_chain rel [lhs, rhs]
@@ -124,13 +131,16 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
           | some p => intermed_steps ++ [(rhs, p)]
           | none   => intermed_steps
         -- Build replacement step strings
-        let step_strs : List String <- allSteps.mapM fun (e, tac) => do
-          let e_s := (<- ppExpr e)
-            |>.pretty (width := wrap_width) (indent := col) (column := col)
-          let tac_s := (<- PrettyPrinter.ppTactic tac)
-            |>.pretty (width := wrap_width) (indent := col)
-                      (column := col + 4)
-          return s!"_ {rel} {e_s}\n{spc}    := by {tac_s}"
+        let step_fmts <- allSteps.mapM fun (e, tac) => do
+          -- TODO: Need to make it work with the old style calc tactic too.
+          -- Give the param in mkStepSrc, and also the column in pretty should
+          -- be changed back to params.indent. (Or, the calc tactic should
+          -- just send 'relIndent ≡ indent')
+          return mkStepSrc rel (<- ppExpr e) (<- PrettyPrinter.ppTactic tac) params
+        let steps_fmt := Std.Format.joinSep step_fmts f!"\n"
+        let render := Std.Format.pretty
+          (width := wrap_width)
+          (indent := params.indent)
         let info_html : Html :=
           <div style={json% { paddingTop: "5px", paddingBottom: "5px" }}>
             {sugg.info? |>.getD (.text "")}
@@ -147,17 +157,20 @@ def suggestion_rpc : (params : CalcParams) -> RequestM (RequestTask Html) :=
           | [(_, _)] =>
             -- Single step: closes the goal directly
             let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}{step_strs[0]!}"
-              else step_strs[0]!
+              then render f!"{lhs_s}\n{steps_fmt}"
+              else render steps_fmt
             pure (new_line, #[
               .text "(closes this goal)",
               info_html
             ])
           | _ =>
             -- Multiple steps: show the chain
+            -- let new_line := if params.isFirst
+            --   then s!"{lhs_s}\n{spc}" ++ String.intercalate s!"\n{spc}" step_strs
+            --   else String.intercalate s!"\n{spc}" step_strs
             let new_line := if params.isFirst
-              then s!"{lhs_s}\n{spc}" ++ String.intercalate s!"\n{spc}" step_strs
-              else String.intercalate s!"\n{spc}" step_strs
+              then render f!"{lhs_s}\n{steps_fmt}"
+              else render steps_fmt
             -- Display: current goal → new chain of expressions
             let intermed_exprs := intermed_steps.map (·.1)
             let all_exprs := [lhs] ++ intermed_exprs ++ [rhs]

@@ -1618,8 +1618,8 @@ elab "#typeset " id:ident : command => do
   | none => throwUnknownIdentifierAt id "Unknown identifier"
   | _ => throwErrorAt id "Not a definition: {c}"
 
-#print revCalc
-#typeset revCalc
+-- #print revCalc
+-- #typeset revCalc
 
 -- inductive Exp' : Type
 --   | val : Nat -> Exp'

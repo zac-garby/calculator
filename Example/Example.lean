@@ -180,6 +180,15 @@ def seq (n : Nat) : List Nat := match n with
   | 0 => []
   | n+1 => 1 :: map .succ (seq n)
 
+lemma lem1 {a b} {r : List α} : length (a :: b :: r) = 2 + length r := by calc
+  length (a :: b :: r)
+  _ = length r + 1 + 1
+      := by rfl
+  _ = 2 + length r
+      -- TODO: Need to make the suggestor come up with this one.
+      := by todo
+
+#check List.rec
 
 section Test
 
